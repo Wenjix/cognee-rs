@@ -7,7 +7,7 @@
 use cognee_utils::NAMESPACE_OID;
 use uuid::Uuid;
 
-use crate::chunk_by_sentence::chunk_by_sentence;
+use crate::chunk_by_sentence::{RECOUNT_BUDGET_FACTOR, chunk_by_sentence};
 use crate::cut_type::CutType;
 use crate::token_counter::{TokenCountMode, TokenCounter};
 
@@ -69,6 +69,9 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
     // Track the byte range of the current chunk in `data`.
     let mut chunk_start: Option<usize> = None;
     let mut chunk_end: usize = 0;
+    // Bytes passed to Span confirmation recounts for the current chunk;
+    // reset whenever a chunk is emitted/started (see RECOUNT_BUDGET_FACTOR).
+    let mut recount_scanned: usize = 0;
 
     for sentence in &sentences {
         let sent_start = sentence.text.as_ptr() as usize - data.as_ptr() as usize;
@@ -87,10 +90,17 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
             && mode == TokenCountMode::Span
             && let Some(start) = chunk_start
         {
-            let exact_with_sentence = counter.count_tokens(&data[start..sent_end]);
-            if exact_with_sentence <= max_chunk_size {
-                overflows = false;
-                next_size = exact_with_sentence;
+            let len = sent_end - start;
+            if recount_scanned + len > RECOUNT_BUDGET_FACTOR * len {
+                // Recount budget exhausted: treat the suspected overflow as
+                // real rather than scanning the whole span again.
+            } else {
+                recount_scanned += len;
+                let exact_with_sentence = counter.count_tokens(&data[start..sent_end]);
+                if exact_with_sentence <= max_chunk_size {
+                    overflows = false;
+                    next_size = exact_with_sentence;
+                }
             }
         }
 
@@ -109,6 +119,7 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
             // below is unconditional and keys off `overflows`.
             chunk_start = None;
             chunk_index += 1;
+            recount_scanned = 0;
         }
 
         paragraph_ids.push(sentence.paragraph_id);
@@ -141,6 +152,7 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
             current_chunk_size = 0;
             chunk_start = None;
             chunk_index += 1;
+            recount_scanned = 0;
         }
 
         last_cut_type = sentence.cut_type.clone();
@@ -297,6 +309,54 @@ mod tests {
             last.cut_type,
             CutType::SentenceCut,
             "last chunk should be SentenceCut when text doesn't end with punctuation"
+        );
+    }
+
+    /// Sums the bytes a counter is asked to count, so a test can bound the
+    /// total work a chunker does instead of timing it.
+    struct CountedBytes<'a, C: TokenCounter> {
+        inner: &'a C,
+        scanned: std::cell::Cell<usize>,
+    }
+
+    impl<C: TokenCounter> TokenCounter for CountedBytes<'_, C> {
+        fn count_tokens(&self, text: &str) -> usize {
+            self.scanned.set(self.scanned.get() + text.len());
+            self.inner.count_tokens(text)
+        }
+    }
+
+    #[test]
+    fn span_recounts_stay_linear_on_boundary_free_text() {
+        // No whitespace between "sentences": the per-sentence accumulator
+        // overflows while the real span barely grows, so before the recount
+        // budget every suspected overflow was confirmed by rescanning the
+        // ever-growing span — O(n^2) counted bytes.
+        let data = "a.".repeat(200_000);
+        let inner = WordCounter;
+        let counter = CountedBytes {
+            inner: &inner,
+            scanned: std::cell::Cell::new(0),
+        };
+        let limit = 32 * data.len();
+
+        let chunks = chunk_by_paragraph(&data, 1_000, true, &counter, TokenCountMode::Span);
+        assert!(!chunks.is_empty());
+        assert!(
+            counter.scanned.get() <= limit,
+            "paragraph chunker counted {} bytes for {} input bytes",
+            counter.scanned.get(),
+            data.len()
+        );
+
+        counter.scanned.set(0);
+        let chunks = chunk_by_sentence(&data, Some(1_000), &counter, TokenCountMode::Span);
+        assert!(!chunks.is_empty());
+        assert!(
+            counter.scanned.get() <= limit,
+            "sentence chunker counted {} bytes for {} input bytes",
+            counter.scanned.get(),
+            data.len()
         );
     }
 }
