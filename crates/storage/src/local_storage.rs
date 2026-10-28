@@ -78,6 +78,36 @@ impl LocalStorage {
         unreachable!("the retry loop returns on success or the last error")
     }
 
+    /// Best-effort removal of the per-file directory `generate_storage_path`
+    /// gives every stored file — `ab/cd/<32 lowercase hex>`. It only ever
+    /// holds that one file, so `remove_dir` succeeds exactly when empty; a
+    /// legacy `ab/cd` fan-out directory is never touched.
+    async fn remove_uuid_dir(file_path: &std::path::Path) {
+        let Some(parent) = file_path.parent() else {
+            return;
+        };
+        let is_uuid_dir = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n.len() == 32
+                    && n.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            });
+        if is_uuid_dir {
+            let _ = fs::remove_dir(parent).await; // succeeds only when empty
+        }
+    }
+
+    /// Best-effort removal of a half-written stored file and its per-file
+    /// directory: a failed `store`/`store_stream_dyn` must not leak a
+    /// partial artifact under a location it never returned.
+    async fn cleanup_failed_write(&self, relative_path: &str) {
+        let full_path = self.base_path.join(relative_path);
+        let _ = fs::remove_file(&full_path).await;
+        Self::remove_uuid_dir(&full_path).await;
+    }
+
     /// Resolve a location string into a filesystem path.
     ///
     /// Mirrors Python's `get_data_file_path()` + `open_data_file()` which
@@ -115,13 +145,17 @@ impl StorageTrait for LocalStorage {
         Self::validate_file_name(file_name)?;
         let (relative_path, mut file) = self.create_destination(file_name).await?;
 
-        file.write_all(data)
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to write file: {e}")))?;
+        if let Err(e) = file.write_all(data).await {
+            drop(file);
+            self.cleanup_failed_write(&relative_path).await;
+            return Err(StorageError::IoError(format!("Failed to write file: {e}")));
+        }
 
-        file.flush()
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to flush file: {e}")))?;
+        if let Err(e) = file.flush().await {
+            drop(file);
+            self.cleanup_failed_write(&relative_path).await;
+            return Err(StorageError::IoError(format!("Failed to flush file: {e}")));
+        }
 
         Ok(relative_path)
     }
@@ -136,13 +170,17 @@ impl StorageTrait for LocalStorage {
         let (relative_path, mut file) = self.create_destination(file_name).await?;
 
         // Stream copy from reader to file
-        tokio::io::copy(reader, &mut file)
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to write file: {e}")))?;
+        if let Err(e) = tokio::io::copy(reader, &mut file).await {
+            drop(file);
+            self.cleanup_failed_write(&relative_path).await;
+            return Err(StorageError::IoError(format!("Failed to write file: {e}")));
+        }
 
-        file.flush()
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to flush file: {e}")))?;
+        if let Err(e) = file.flush().await {
+            drop(file);
+            self.cleanup_failed_write(&relative_path).await;
+            return Err(StorageError::IoError(format!("Failed to flush file: {e}")));
+        }
 
         Ok(relative_path)
     }
@@ -187,7 +225,12 @@ impl StorageTrait for LocalStorage {
             } else {
                 StorageError::IoError(format!("Failed to delete file: {e}"))
             }
-        })
+        })?;
+
+        // The per-file UUID directory is now empty — best-effort remove it
+        // so deletes do not leak `ab/cd/<32hex>` skeletons.
+        Self::remove_uuid_dir(&full_path).await;
+        Ok(())
     }
 
     fn get_full_path(&self, location: &str) -> PathBuf {
@@ -277,6 +320,44 @@ mod tests {
 
         assert!(storage.exists(&location).await.unwrap());
         assert!(!storage.exists("nonexistent.txt").await.unwrap());
+    }
+
+    /// The per-file UUID directory a store creates must go with its file —
+    /// otherwise every delete leaks an `ab/cd/<32hex>` skeleton.
+    #[tokio::test]
+    async fn delete_removes_the_per_file_uuid_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_path_buf());
+        storage.initialize().await.unwrap();
+
+        let location = storage.store(b"data", "file.txt").await.unwrap();
+        let uuid_dir = temp_dir
+            .path()
+            .join(&location)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(uuid_dir.is_dir(), "store should create the UUID dir");
+
+        storage.delete(&location).await.unwrap();
+        assert!(!uuid_dir.exists(), "delete must remove the empty UUID dir");
+    }
+
+    /// A file at a legacy `ab/cd/name` location (pre-UUID layout) deletes the
+    /// file only — the shared fan-out directories hold other files' UUID
+    /// dirs and must never be touched.
+    #[tokio::test]
+    async fn delete_of_a_legacy_location_leaves_the_fanout_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_path_buf());
+        storage.initialize().await.unwrap();
+
+        let legacy = temp_dir.path().join("ab/cd");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("file.txt"), b"old").unwrap();
+
+        storage.delete("ab/cd/file.txt").await.unwrap();
+        assert!(legacy.is_dir(), "the shared ab/cd dirs must survive");
     }
 
     #[test]
