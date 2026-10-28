@@ -262,8 +262,8 @@ fn trace_session_file(base: &Path, user_id: &str, session_id: &str) -> PathBuf {
 /// so it must be left alone. A file that parses as neither a Q&A list nor
 /// the expected record kind cannot be a sibling's data and is removed.
 async fn remove_record_file(path: &Path) -> Result<(), SessionError> {
-    match fs::read_to_string(path).await {
-        Ok(contents) if serde_json::from_str::<Vec<FsQAEntry>>(&contents).is_ok() => {
+    match fs::read(path).await {
+        Ok(contents) if serde_json::from_slice::<Vec<FsQAEntry>>(&contents).is_ok() => {
             tracing::debug!(
                 target: "cognee.session",
                 path = %path.display(),
@@ -1165,6 +1165,25 @@ mod tests {
             .unwrap();
         assert!(store.delete_session("s", Some("u1")).await.unwrap());
         assert!(!trace_session_file(base, "u1", "s").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_a_record_file_with_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let store = FsSessionStore::new(base);
+        store
+            .create_qa_entry("s", Some("u1"), "q", "a", None)
+            .await
+            .unwrap();
+        // A damaged trace file — e.g. an interrupted external restore —
+        // cannot be a sibling's Q&A list and must not block erasure.
+        let trace_path = trace_session_file(base, "u1", "s");
+        std::fs::write(&trace_path, [0xFF, 0xFE, b'{']).unwrap();
+
+        assert!(store.delete_session("s", Some("u1")).await.unwrap());
+        assert!(!trace_path.exists());
+        assert!(!session_file(base, Some("u1"), "s").exists());
     }
 
     #[tokio::test]
