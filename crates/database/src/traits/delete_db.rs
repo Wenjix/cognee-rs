@@ -152,6 +152,50 @@ pub trait DeleteDb: Send + Sync {
         candidates: &[String],
     ) -> Result<Vec<String>, DatabaseError>;
 
+    /// Node rows of `dataset_id` whose slug no row of another dataset claims
+    /// — the shared-store uniqueness rule for dataset deletion.
+    async fn get_nodes_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError>;
+
+    /// Edge rows of `dataset_id` whose slug no row of another dataset claims.
+    async fn get_edges_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError>;
+
+    /// Node rows of `(data_id, dataset_id)` whose slug no row outside that
+    /// pair claims — the shared-store uniqueness rule for item deletion.
+    async fn get_nodes_unique_to_data_in_store(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError>;
+
+    /// Edge rows of `(data_id, dataset_id)` whose slug no row outside that
+    /// pair claims.
+    async fn get_edges_unique_to_data_in_store(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError>;
+
+    /// The subset of `candidates` (`EdgeType` retrieval texts) still claimed
+    /// by edge rows that survive the deletion of `dataset_id`.
+    async fn get_edge_retrieval_texts_claimed_outside_dataset(
+        &self,
+        dataset_id: Uuid,
+        candidates: &[String],
+    ) -> Result<Vec<String>, DatabaseError>;
+
+    /// The subset of `slugs` that still has at least one provenance node row
+    /// in any dataset — the claim check for the shared-store orphan sweep.
+    async fn get_node_slugs_with_claims(
+        &self,
+        slugs: &[String],
+    ) -> Result<std::collections::HashSet<String>, DatabaseError>;
+
     /// Delete all provenance node rows for a dataset.
     async fn delete_provenance_nodes_for_dataset(
         &self,
@@ -358,6 +402,54 @@ impl DeleteDb for DatabaseConnection {
             self, data_id, dataset_id, candidates,
         )
         .await
+    }
+
+    async fn get_nodes_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        graph_storage::get_nodes_unique_to_dataset(self, dataset_id).await
+    }
+
+    async fn get_edges_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        graph_storage::get_edges_unique_to_dataset(self, dataset_id).await
+    }
+
+    async fn get_nodes_unique_to_data_in_store(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        graph_storage::get_nodes_unique_to_data_in_store(self, data_id, dataset_id).await
+    }
+
+    async fn get_edges_unique_to_data_in_store(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        graph_storage::get_edges_unique_to_data_in_store(self, data_id, dataset_id).await
+    }
+
+    async fn get_edge_retrieval_texts_claimed_outside_dataset(
+        &self,
+        dataset_id: Uuid,
+        candidates: &[String],
+    ) -> Result<Vec<String>, DatabaseError> {
+        graph_storage::get_edge_retrieval_texts_claimed_outside_dataset(
+            self, dataset_id, candidates,
+        )
+        .await
+    }
+
+    async fn get_node_slugs_with_claims(
+        &self,
+        slugs: &[String],
+    ) -> Result<std::collections::HashSet<String>, DatabaseError> {
+        graph_storage::get_node_slugs_with_claims(self, slugs).await
     }
 
     async fn delete_provenance_nodes_for_dataset(

@@ -853,21 +853,26 @@ impl DeleteService {
 
             // Data-scoped cleanup (for single data item deletion)
             if request.scope.is_data_item() {
-                // Compute which data IDs will actually be deleted
-                let deletable_data_ids = self.compute_deletable_data_ids(&targets).await?;
-
-                for data_id in &deletable_data_ids {
-                    for (dataset_id, did) in &targets.links_to_detach {
-                        if did == data_id {
-                            let (gn, vp, pn, pe, gv_warnings) =
-                                self.cleanup_data(*data_id, *dataset_id).await?;
-                            deleted_graph_nodes += gn;
-                            deleted_vector_points += vp;
-                            deleted_provenance_nodes += pn;
-                            deleted_provenance_edges += pe;
-                            warnings.extend(gv_warnings);
-                        }
+                // Every removed (dataset, data) pair gets its cleanup — not
+                // only pairs whose data row fully goes (M03). Python runs
+                // `delete_data_nodes_and_edges` for each link removed: the
+                // pair's ledger rows go either way, and its artifacts go when
+                // no other pair still claims them. When the data row survives
+                // in another dataset, a skipped cleanup used to leave the
+                // detached dataset's own databases (or the shared store's
+                // orphans) serving the removed content.
+                let mut cleaned: HashSet<(Uuid, Uuid)> = HashSet::new();
+                for (dataset_id, data_id) in &targets.links_to_detach {
+                    if !cleaned.insert((*dataset_id, *data_id)) {
+                        continue;
                     }
+                    let (gn, vp, pn, pe, gv_warnings) =
+                        self.cleanup_data(*data_id, *dataset_id).await?;
+                    deleted_graph_nodes += gn;
+                    deleted_vector_points += vp;
+                    deleted_provenance_nodes += pn;
+                    deleted_provenance_edges += pe;
+                    warnings.extend(gv_warnings);
                 }
             }
         }
@@ -1028,8 +1033,10 @@ impl DeleteService {
                 vec![None]
             };
             for scope in sweep_scopes {
+                // Scope `None` is the shared store: the sweep must not take
+                // a node another dataset's ledger still claims (M04).
                 let sweeps = async {
-                    let nodes = self.sweep_orphan_nodes().await?;
+                    let nodes = self.sweep_orphan_nodes(scope.is_none()).await?;
                     let edge_types = self.sweep_orphan_edge_types().await?;
                     Ok::<_, DeleteError>((nodes, edge_types))
                 };
@@ -1153,19 +1160,21 @@ impl DeleteService {
             }
 
             if request.scope.is_data_item() {
-                let deletable_data_ids = self.compute_deletable_data_ids(targets).await?;
-                for data_id in &deletable_data_ids {
-                    for (dataset_id, did) in &targets.links_to_detach {
-                        if did == data_id {
-                            let (gn, vp, pn, pe, gv_warnings) =
-                                self.cleanup_data(*data_id, *dataset_id).await?;
-                            deleted_graph_nodes += gn;
-                            deleted_vector_points += vp;
-                            deleted_provenance_nodes += pn;
-                            deleted_provenance_edges += pe;
-                            warnings.extend(gv_warnings);
-                        }
+                // Every removed (dataset, data) pair gets its cleanup — see
+                // the main path above (M03); the data row itself is decided
+                // by the relational phase, not here.
+                let mut cleaned: HashSet<(Uuid, Uuid)> = HashSet::new();
+                for (dataset_id, data_id) in &targets.links_to_detach {
+                    if !cleaned.insert((*dataset_id, *data_id)) {
+                        continue;
                     }
+                    let (gn, vp, pn, pe, gv_warnings) =
+                        self.cleanup_data(*data_id, *dataset_id).await?;
+                    deleted_graph_nodes += gn;
+                    deleted_vector_points += vp;
+                    deleted_provenance_nodes += pn;
+                    deleted_provenance_edges += pe;
+                    warnings.extend(gv_warnings);
                 }
             }
         }
@@ -1516,17 +1525,43 @@ impl DeleteService {
                 return Ok((0, 0, 0, 0, warnings));
             }
 
+            // Shared store (M05): only the artifacts no other dataset claims
+            // may go. `get_…_unique_to_dataset` answers the dataset's rows
+            // whose slug has no claim from any `dataset_id <> D` row —
+            // Python's `get_global_dataset_related_nodes/edges`.
+            let unique_nodes = self
+                .database
+                .get_nodes_unique_to_dataset(dataset_id)
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to get unique provenance nodes for dataset {dataset_id}: {e}"
+                    ))
+                })?;
+            let unique_edges = self
+                .database
+                .get_edges_unique_to_dataset(dataset_id)
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to get unique provenance edges for dataset {dataset_id}: {e}"
+                    ))
+                })?;
+
             // --- Graph cleanup ---
-            let (gn, gw) = delete_graph_artifacts(self.graph_db.as_ref(), &nodes).await?;
+            let (gn, gw) = delete_graph_artifacts(self.graph_db.as_ref(), &unique_nodes).await?;
             graph_node_count += gn;
             warnings.extend(gw);
 
             // --- Vector cleanup ---
+            let edge_type_ids = self
+                .edge_type_ids_unique_to_dataset(dataset_id, &unique_edges)
+                .await?;
             let (vp, vw) = delete_vector_artifacts(
                 self.vector_db.as_ref(),
-                &nodes,
-                &edges,
-                &unchecked_edge_type_vector_ids(&edges),
+                &unique_nodes,
+                &unique_edges,
+                &edge_type_ids,
             )
             .await?;
             vector_point_count += vp;
@@ -1590,25 +1625,52 @@ impl DeleteService {
         let mut graph_node_count = 0usize;
         let mut vector_point_count = 0usize;
 
-        let nodes = self
-            .database
-            .get_unique_nodes_for_data(data_id, dataset_id)
-            .await
-            .map_err(|e| {
-                DeleteError::Runtime(format!(
-                    "Failed to get unique provenance nodes for data {data_id}: {e}"
-                ))
-            })?;
-
-        let edges = self
-            .database
-            .get_unique_edges_for_data(data_id, dataset_id)
-            .await
-            .map_err(|e| {
-                DeleteError::Runtime(format!(
-                    "Failed to get unique provenance edges for data {data_id}: {e}"
-                ))
-            })?;
+        // The uniqueness rule depends on storage: under per-dataset storage
+        // the item's artifacts live in this dataset's own databases, so a
+        // slug shared only *within* the dataset is safe to drop
+        // (`get_unique_…_for_data`). In the shared store the same artifact
+        // can be claimed by (other dataset, other data) pairs, so only the
+        // store-wide rule — no row outside this (dataset, data) pair claims
+        // the slug — may delete it (M05; Python `get_global_data_related_*`).
+        let (nodes, edges) = if self.dataset_storage.is_some() {
+            (
+                self.database
+                    .get_unique_nodes_for_data(data_id, dataset_id)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to get unique provenance nodes for data {data_id}: {e}"
+                        ))
+                    })?,
+                self.database
+                    .get_unique_edges_for_data(data_id, dataset_id)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to get unique provenance edges for data {data_id}: {e}"
+                        ))
+                    })?,
+            )
+        } else {
+            (
+                self.database
+                    .get_nodes_unique_to_data_in_store(data_id, dataset_id)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to get unique provenance nodes for data {data_id}: {e}"
+                        ))
+                    })?,
+                self.database
+                    .get_edges_unique_to_data_in_store(data_id, dataset_id)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to get unique provenance edges for data {data_id}: {e}"
+                        ))
+                    })?,
+            )
+        };
 
         // Structural edges (`is_part_of`, `contains`, ...) are recorded with a
         // nil `data_id`, so the queries above never see them; find them through
@@ -1766,11 +1828,59 @@ impl DeleteService {
             .collect())
     }
 
+    /// The `EdgeType` point ids a dataset deletion may drop in the shared
+    /// store: every nonblank retrieval text of the dataset's unique edges,
+    /// minus the texts an edge row of another dataset still claims (M05 —
+    /// replaces `unchecked_edge_type_vector_ids`, whose own comment admitted
+    /// it could delete a point a surviving edge needs).
+    async fn edge_type_ids_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+        edges: &[GraphEdge],
+    ) -> Result<Vec<Uuid>, DeleteError> {
+        let candidates: Vec<String> = edges
+            .iter()
+            .map(edge_retrieval_text)
+            .filter(|text| !text.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let claimed: HashSet<String> = self
+            .database
+            .get_edge_retrieval_texts_claimed_outside_dataset(dataset_id, &candidates)
+            .await
+            .map_err(|e| {
+                DeleteError::Runtime(format!(
+                    "Failed to get surviving edge texts for dataset {dataset_id}: {e}"
+                ))
+            })?
+            .into_iter()
+            .collect();
+        Ok(candidates
+            .iter()
+            .filter(|text| !claimed.contains(*text))
+            .map(|text| EdgeType::deterministic_id(text))
+            .collect())
+    }
+
     /// Hard-mode orphan sweep: find and delete degree-one Entity/EntityType
     /// nodes from the graph and their corresponding vector points.
     ///
+    /// `respect_claims` is set when the sweep reaches the shared store
+    /// (scope `None`): a degree-one node whose slug a surviving provenance
+    /// row of *any* dataset still claims is not an orphan for this deletion
+    /// and is kept — the sweep used to take it, its vector point and its
+    /// edges out from under its owner (M04). Unclaimed (e.g. pre-ledger
+    /// legacy) degree-one nodes are still swept as before.
+    ///
     /// Returns `(orphan_entities, orphan_entity_types, warnings)`.
-    async fn sweep_orphan_nodes(&self) -> Result<(usize, usize, Vec<String>), DeleteError> {
+    async fn sweep_orphan_nodes(
+        &self,
+        respect_claims: bool,
+    ) -> Result<(usize, usize, Vec<String>), DeleteError> {
         let mut warnings = Vec::new();
 
         let graph_db = match &self.graph_db {
@@ -1794,6 +1904,35 @@ impl DeleteService {
                     "Failed to query degree-one EntityType nodes: {e}"
                 ))
             })?;
+
+        // Shared store (M04): a degree-one candidate whose slug a surviving
+        // ledger row still claims belongs to that row's owner, whatever the
+        // graph degree says — drop it from the sweep.
+        let claimed: HashSet<String> = if respect_claims {
+            let slugs: Vec<String> = orphan_entities
+                .iter()
+                .chain(orphan_types.iter())
+                .map(|(id, _)| id.clone())
+                .collect();
+            self.database
+                .get_node_slugs_with_claims(&slugs)
+                .await
+                .map_err(|e| {
+                    DeleteError::GraphCleanup(format!(
+                        "Failed to check provenance claims for orphan candidates: {e}"
+                    ))
+                })?
+        } else {
+            HashSet::new()
+        };
+        let orphan_entities: Vec<(String, cognee_graph::NodeData)> = orphan_entities
+            .into_iter()
+            .filter(|(id, _)| !claimed.contains(id))
+            .collect();
+        let orphan_types: Vec<(String, cognee_graph::NodeData)> = orphan_types
+            .into_iter()
+            .filter(|(id, _)| !claimed.contains(id))
+            .collect();
 
         let entity_count = orphan_entities.len();
         let type_count = orphan_types.len();
@@ -1971,7 +2110,34 @@ impl DeleteService {
 
             prov_nodes += nodes.len();
             prov_edges += edges.len();
-            let (gn, vp) = ledger_artifact_counts(&nodes, &edges);
+            // The shared store deletes only artifacts no other dataset
+            // claims (M05); the per-dataset branch drops the whole dataset
+            // storage. Preview counts what execution deletes either way.
+            let (gn, vp) = if self.dataset_storage.is_some() {
+                ledger_artifact_counts(&nodes, &edges)
+            } else {
+                let unique_nodes = self
+                    .database
+                    .get_nodes_unique_to_dataset(dataset.id)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to count unique provenance nodes for dataset {}: {e}",
+                            dataset.id
+                        ))
+                    })?;
+                let unique_edges = self
+                    .database
+                    .get_edges_unique_to_dataset(dataset.id)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to count unique provenance edges for dataset {}: {e}",
+                            dataset.id
+                        ))
+                    })?;
+                ledger_artifact_counts(&unique_nodes, &unique_edges)
+            };
             graph_nodes += gn;
             vector_points += vp;
         }
@@ -1983,6 +2149,10 @@ impl DeleteService {
     // Target resolution
     // ==================================================================
 
+    /// Which `candidate_data_ids` lose their last dataset link in this
+    /// delete — i.e. which *data rows* (and stored files) phase 2 removes.
+    /// Artifact cleanup no longer consults this: it runs per removed
+    /// (dataset, data) link instead (M03).
     async fn compute_deletable_data_ids(
         &self,
         targets: &ResolvedDeleteTargets,
@@ -2589,19 +2759,6 @@ fn parse_indexed_fields(value: &serde_json::Value) -> Vec<String> {
             vec![]
         }
     }
-}
-
-/// Every selected edge's `EdgeType` point id, with no exclusivity check over
-/// the retrieval text — the dataset delete path's long-standing
-/// behavior, kept as it was.
-///
-/// Because that id is many-to-one over edges, this can name a point a surviving
-/// edge of another dataset still needs. The run sweep narrows the set with
-/// `get_edge_retrieval_texts_claimed_outside_run` and the data-scoped path with
-/// `get_edge_retrieval_texts_claimed_outside_data`; doing the same here
-/// changes dataset deletion and belongs with that path's own tests.
-fn unchecked_edge_type_vector_ids(edges: &[GraphEdge]) -> Vec<Uuid> {
-    edges.iter().filter_map(edge_type_vector_id).collect()
 }
 
 /// The `EdgeType` vector point id cognify actually wrote for this edge.

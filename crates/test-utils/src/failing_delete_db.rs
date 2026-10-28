@@ -158,6 +158,56 @@ impl DeleteDb for FailingDeleteDb {
         .await
     }
 
+    async fn get_nodes_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        DeleteDb::get_nodes_unique_to_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn get_edges_unique_to_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        DeleteDb::get_edges_unique_to_dataset(self.inner.as_ref(), dataset_id).await
+    }
+
+    async fn get_nodes_unique_to_data_in_store(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        DeleteDb::get_nodes_unique_to_data_in_store(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn get_edges_unique_to_data_in_store(
+        &self,
+        data_id: Uuid,
+        dataset_id: Uuid,
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        DeleteDb::get_edges_unique_to_data_in_store(self.inner.as_ref(), data_id, dataset_id).await
+    }
+
+    async fn get_edge_retrieval_texts_claimed_outside_dataset(
+        &self,
+        dataset_id: Uuid,
+        candidates: &[String],
+    ) -> Result<Vec<String>, DatabaseError> {
+        DeleteDb::get_edge_retrieval_texts_claimed_outside_dataset(
+            self.inner.as_ref(),
+            dataset_id,
+            candidates,
+        )
+        .await
+    }
+
+    async fn get_node_slugs_with_claims(
+        &self,
+        slugs: &[String],
+    ) -> Result<std::collections::HashSet<String>, DatabaseError> {
+        DeleteDb::get_node_slugs_with_claims(self.inner.as_ref(), slugs).await
+    }
+
     async fn delete_provenance_nodes_for_dataset(
         &self,
         dataset_id: Uuid,

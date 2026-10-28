@@ -738,6 +738,330 @@ pub async fn get_unique_edges_for_data(
     Ok(rows)
 }
 
+/// Node rows of `dataset_id` whose slug no row of another dataset claims —
+/// the shared-store sibling of [`get_unique_nodes_for_data`] (Python
+/// `get_global_dataset_related_nodes`).
+#[instrument(
+    name = "cognee.db.relational.graph_storage.get_nodes_unique_to_dataset",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_nodes_unique_to_dataset(
+    db: &DatabaseConnection,
+    dataset_id: Uuid,
+) -> Result<Vec<GraphNode>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let dataset_hex = uuid_hex::to_hex(dataset_id);
+
+    let n2 = Alias::new("n2");
+    let claimed = Query::select()
+        .expr(Expr::val(1))
+        .from_as(Alias::new("nodes"), n2.clone())
+        .and_where(Expr::col((n2.clone(), node::Column::DatasetId)).ne(dataset_hex.clone()))
+        .and_where(
+            Expr::col((n2.clone(), node::Column::Slug))
+                .equals((Alias::new("nodes"), node::Column::Slug)),
+        )
+        .to_owned();
+
+    let rows: Vec<GraphNode> = node::Entity::find()
+        .filter(node::Column::DatasetId.eq(&dataset_hex))
+        .filter(Expr::exists(claimed).not())
+        .all(db)
+        .await
+        .map_err(map_sea_err)?
+        .into_iter()
+        .map(GraphNode::from)
+        .collect();
+    Span::current().record(COGNEE_DB_ROW_COUNT, rows.len() as i64);
+    Ok(rows)
+}
+
+/// Edge rows of `dataset_id` whose slug no row of another dataset claims —
+/// the shared-store sibling of [`get_unique_edges_for_data`] (Python
+/// `get_global_dataset_related_edges`).
+#[instrument(
+    name = "cognee.db.relational.graph_storage.get_edges_unique_to_dataset",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_edges_unique_to_dataset(
+    db: &DatabaseConnection,
+    dataset_id: Uuid,
+) -> Result<Vec<GraphEdge>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let dataset_hex = uuid_hex::to_hex(dataset_id);
+
+    let e2 = Alias::new("e2");
+    let claimed = Query::select()
+        .expr(Expr::val(1))
+        .from_as(Alias::new("edges"), e2.clone())
+        .and_where(Expr::col((e2.clone(), edge::Column::DatasetId)).ne(dataset_hex.clone()))
+        .and_where(
+            Expr::col((e2.clone(), edge::Column::Slug))
+                .equals((Alias::new("edges"), edge::Column::Slug)),
+        )
+        .to_owned();
+
+    let rows: Vec<GraphEdge> = edge::Entity::find()
+        .filter(edge::Column::DatasetId.eq(&dataset_hex))
+        .filter(Expr::exists(claimed).not())
+        .all(db)
+        .await
+        .map_err(map_sea_err)?
+        .into_iter()
+        .map(GraphEdge::from)
+        .collect();
+    Span::current().record(COGNEE_DB_ROW_COUNT, rows.len() as i64);
+    Ok(rows)
+}
+
+/// Node rows of `(data_id, dataset_id)` whose slug no row outside that pair
+/// claims — Python's `get_global_data_related_nodes`, the shared-store rule:
+/// the slug may only go when no `(dataset_id <> D OR data_id <> X)` row
+/// still names it.
+#[instrument(
+    name = "cognee.db.relational.graph_storage.get_nodes_unique_to_data_in_store",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_nodes_unique_to_data_in_store(
+    db: &DatabaseConnection,
+    data_id: Uuid,
+    dataset_id: Uuid,
+) -> Result<Vec<GraphNode>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let data_hex = uuid_hex::to_hex(data_id);
+    let dataset_hex = uuid_hex::to_hex(dataset_id);
+
+    let n2 = Alias::new("n2");
+    let claimed = Query::select()
+        .expr(Expr::val(1))
+        .from_as(Alias::new("nodes"), n2.clone())
+        .and_where(
+            Expr::col((n2.clone(), node::Column::Slug))
+                .equals((Alias::new("nodes"), node::Column::Slug)),
+        )
+        .and_where(
+            Condition::any()
+                .add(Expr::col((n2.clone(), node::Column::DatasetId)).ne(dataset_hex.clone()))
+                .add(Expr::col((n2.clone(), node::Column::DataId)).ne(data_hex.clone()))
+                .into(),
+        )
+        .to_owned();
+
+    let rows: Vec<GraphNode> = node::Entity::find()
+        .filter(node::Column::DataId.eq(&data_hex))
+        .filter(node::Column::DatasetId.eq(&dataset_hex))
+        .filter(Expr::exists(claimed).not())
+        .all(db)
+        .await
+        .map_err(map_sea_err)?
+        .into_iter()
+        .map(GraphNode::from)
+        .collect();
+    Span::current().record(COGNEE_DB_ROW_COUNT, rows.len() as i64);
+    Ok(rows)
+}
+
+/// Edge rows of `(data_id, dataset_id)` whose slug no row outside that pair
+/// claims — the edge twin of [`get_nodes_unique_to_data_in_store`] (Python
+/// `get_global_data_related_edges`).
+#[instrument(
+    name = "cognee.db.relational.graph_storage.get_edges_unique_to_data_in_store",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_edges_unique_to_data_in_store(
+    db: &DatabaseConnection,
+    data_id: Uuid,
+    dataset_id: Uuid,
+) -> Result<Vec<GraphEdge>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let data_hex = uuid_hex::to_hex(data_id);
+    let dataset_hex = uuid_hex::to_hex(dataset_id);
+
+    let e2 = Alias::new("e2");
+    let claimed = Query::select()
+        .expr(Expr::val(1))
+        .from_as(Alias::new("edges"), e2.clone())
+        .and_where(
+            Expr::col((e2.clone(), edge::Column::Slug))
+                .equals((Alias::new("edges"), edge::Column::Slug)),
+        )
+        .and_where(
+            Condition::any()
+                .add(Expr::col((e2.clone(), edge::Column::DatasetId)).ne(dataset_hex.clone()))
+                .add(Expr::col((e2.clone(), edge::Column::DataId)).ne(data_hex.clone()))
+                .into(),
+        )
+        .to_owned();
+
+    let rows: Vec<GraphEdge> = edge::Entity::find()
+        .filter(edge::Column::DataId.eq(&data_hex))
+        .filter(edge::Column::DatasetId.eq(&dataset_hex))
+        .filter(Expr::exists(claimed).not())
+        .all(db)
+        .await
+        .map_err(map_sea_err)?
+        .into_iter()
+        .map(GraphEdge::from)
+        .collect();
+    Span::current().record(COGNEE_DB_ROW_COUNT, rows.len() as i64);
+    Ok(rows)
+}
+
+/// The `candidates` (`EdgeType` retrieval texts) still claimed by edge rows
+/// that survive the deletion of `dataset_id` — the dataset-scoped twin of
+/// [`get_edge_retrieval_texts_claimed_outside_data`]: a row survives while
+/// `dataset_id <> D`, and only live rows claim a text
+/// ([`edge_row_is_live_claim`]).
+#[instrument(
+    name = "cognee.db.relational.graph_storage.get_edge_retrieval_texts_claimed_outside_dataset",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_edge_retrieval_texts_claimed_outside_dataset(
+    db: &DatabaseConnection,
+    dataset_id: Uuid,
+    candidates: &[String],
+) -> Result<Vec<String>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let dataset_hex = uuid_hex::to_hex(dataset_id);
+    let wanted: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+    let surviving = || {
+        Condition::all()
+            .add(edge::Column::DatasetId.ne(&dataset_hex))
+            .add(edge_row_is_live_claim())
+    };
+
+    let mut claimed = BTreeSet::new();
+    if wanted.is_empty() {
+        Span::current().record(COGNEE_DB_ROW_COUNT, 0i64);
+        return Ok(Vec::new());
+    }
+    let backend = db.get_database_backend();
+    match edge_text_sql(backend) {
+        Some(edge_text) => {
+            // `trim(x, chars)` on SQLite, `btrim(x, chars)` on Postgres (the
+            // only backends `edge_text_sql` answers for).
+            let trim = Alias::new(if backend == DbBackend::Postgres {
+                "btrim"
+            } else {
+                "trim"
+            });
+            let trimmed = |expr: SimpleExpr| {
+                Expr::expr(
+                    Func::cust(trim.clone())
+                        .arg(expr)
+                        .arg(Expr::val(UNICODE_WHITE_SPACE)),
+                )
+            };
+            let wanted: Vec<&str> = wanted.iter().copied().collect();
+            for batch in wanted.chunks(CANDIDATE_TEXT_BATCH) {
+                let produces_candidate = Condition::any()
+                    .add(
+                        trimmed(Expr::col(edge::Column::RelationshipName).into())
+                            .is_in(batch.iter().copied()),
+                    )
+                    .add(trimmed(Expr::cust(edge_text)).is_in(batch.iter().copied()));
+                for text in retrieval_texts_where(db, surviving().add(produces_candidate)).await? {
+                    if batch.contains(&text.as_str()) {
+                        claimed.insert(text);
+                    }
+                }
+            }
+        }
+        None => {
+            for text in retrieval_texts_where(db, surviving()).await? {
+                if wanted.contains(text.as_str()) {
+                    claimed.insert(text);
+                }
+            }
+        }
+    }
+    Span::current().record(COGNEE_DB_ROW_COUNT, claimed.len() as i64);
+    Ok(claimed.into_iter().collect())
+}
+
+/// The subset of `slugs` that still has at least one provenance node row, in
+/// any dataset — the claim check for the shared-store orphan sweep: a
+/// degree-one graph node whose slug a surviving ledger row names is still
+/// claimed and must not be swept. Batched like the candidate lists of
+/// [`get_edge_retrieval_texts_claimed_outside_data`].
+#[instrument(
+    name = "cognee.db.relational.graph_storage.get_node_slugs_with_claims",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_node_slugs_with_claims(
+    db: &DatabaseConnection,
+    slugs: &[String],
+) -> Result<std::collections::HashSet<String>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    // Ledger slugs are stored as `uuid_hex`; only parseable ids can match.
+    let mut by_hex: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(slugs.len());
+    for slug in slugs {
+        if let Ok(id) = Uuid::parse_str(slug) {
+            by_hex.insert(uuid_hex::to_hex(id), slug.clone());
+        }
+    }
+
+    let mut claimed = std::collections::HashSet::new();
+    let hexes: Vec<String> = by_hex.keys().cloned().collect();
+    for batch in hexes.chunks(CANDIDATE_TEXT_BATCH * 4) {
+        // `SELECT DISTINCT slug` has no entity shape, so sea-query builds the
+        // statement for the connection's backend (Postgres wants $n
+        // placeholders, `?` is SQLite-only).
+        let query = Query::select()
+            .distinct()
+            .column(node::Column::Slug)
+            .from(node::Entity)
+            .and_where(node::Column::Slug.is_in(batch.iter().cloned()))
+            .to_owned();
+        let stmt = db.get_database_backend().build(&query);
+        for row in db.query_all(stmt).await.map_err(map_sea_err)? {
+            let slug: String = row.try_get("", "slug").map_err(map_sea_err)?;
+            if let Some(original) = by_hex.get(&slug) {
+                claimed.insert(original.clone());
+            }
+        }
+    }
+    Span::current().record(COGNEE_DB_ROW_COUNT, claimed.len() as i64);
+    Ok(claimed)
+}
+
 /// `EXISTS (SELECT 1 FROM nodes AS n WHERE n.slug = edges.<endpoint> AND ...)`:
 /// whether some node row, narrowed by `narrow`, claims the edge row's
 /// `endpoint`. Correlated, so both backends can plan it per edge row through

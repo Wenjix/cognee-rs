@@ -89,6 +89,59 @@ async fn upserts_large_graph_without_variable_overflow() {
 /// no-op under the project's per-process `cargo nextest` runner anyway) and can
 /// never clobber a developer's existing data.
 #[cfg(feature = "postgres")]
+/// `get_node_slugs_with_claims` returns exactly the slugs that have a
+/// provenance node row — an unclaimed UUID and a non-UUID string are absent.
+#[tokio::test]
+async fn node_slugs_with_claims_returns_only_claimed_slugs() {
+    let db = connect("sqlite::memory:").await.expect("connect");
+    initialize(&db).await.expect("migrate");
+
+    let user = Uuid::new_v4();
+    let dataset = Uuid::new_v4();
+    let data = Uuid::new_v4();
+    create_dataset(&db, Dataset::new("claims".into(), user, None, dataset))
+        .await
+        .expect("seed dataset");
+
+    let claimed = Uuid::new_v4();
+    upsert_nodes(
+        &db,
+        &[GraphNode {
+            id: Uuid::new_v4(),
+            slug: claimed,
+            user_id: user,
+            data_id: data,
+            dataset_id: dataset,
+            pipeline_run_id: None,
+            label: Some("Entity".into()),
+            node_type: "Entity".into(),
+            indexed_fields: json!({ "index_fields": ["name"] }),
+            attributes: None,
+            created_at: Utc::now(),
+        }],
+    )
+    .await
+    .expect("seed provenance node");
+
+    let unclaimed = Uuid::new_v4();
+    let hits = cognee_database::DeleteDb::get_node_slugs_with_claims(
+        &db,
+        &[
+            claimed.to_string(),
+            unclaimed.to_string(),
+            "not-a-uuid".to_string(),
+        ],
+    )
+    .await
+    .expect("claim query");
+
+    assert_eq!(
+        hits,
+        std::collections::HashSet::from([claimed.to_string()]),
+        "only the ledger-claimed slug may come back"
+    );
+}
+
 mod postgres {
     use super::*;
     use cognee_database::ops::graph_storage::{get_edges_by_data, get_nodes_by_data};
@@ -103,6 +156,67 @@ mod postgres {
     /// batch, keeping the LAST occurrence to preserve upsert-update semantics — so
     /// this must succeed and store exactly one row reflecting the last write.
     ///
+    /// The `?`-placeholder raw statement `get_node_slugs_with_claims` used to
+    /// emit fails Postgres outright (`$n` only); the sea-query build fixes it.
+    /// Skipped when `TEST_POSTGRES_URL` is unset.
+    #[tokio::test]
+    async fn node_slugs_with_claims_runs_on_postgres() {
+        let Some(base_url) = cognee_test_utils::test_postgres_url() else {
+            eprintln!(
+                "TEST_POSTGRES_URL not set — skipping node_slugs_with_claims_runs_on_postgres"
+            );
+            return;
+        };
+        let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
+            .await
+            .expect("create temp Postgres database");
+        let db = connect(tmp.url()).await.expect("connect to temp Postgres");
+        initialize(&db).await.expect("migrate relational schema");
+
+        let user = Uuid::new_v4();
+        let dataset = Uuid::new_v4();
+        let data = Uuid::new_v4();
+        create_dataset(&db, Dataset::new("pg-claims".into(), user, None, dataset))
+            .await
+            .expect("seed dataset");
+        let claimed = Uuid::new_v4();
+        upsert_nodes(
+            &db,
+            &[GraphNode {
+                id: Uuid::new_v4(),
+                slug: claimed,
+                user_id: user,
+                data_id: data,
+                dataset_id: dataset,
+                pipeline_run_id: None,
+                label: Some("Entity".into()),
+                node_type: "Entity".into(),
+                indexed_fields: json!({ "index_fields": ["name"] }),
+                attributes: None,
+                created_at: Utc::now(),
+            }],
+        )
+        .await
+        .expect("seed provenance node");
+
+        let hits = cognee_database::DeleteDb::get_node_slugs_with_claims(
+            &db,
+            &[
+                claimed.to_string(),
+                Uuid::new_v4().to_string(),
+                "not-a-uuid".to_string(),
+            ],
+        )
+        .await
+        .expect("claim query must not error on Postgres");
+
+        assert_eq!(
+            hits,
+            std::collections::HashSet::from([claimed.to_string()]),
+            "only the ledger-claimed slug may come back"
+        );
+    }
+
     /// Skipped when `TEST_POSTGRES_URL` is unset. SQLite tolerates the duplicate,
     /// so this scenario only reproduces on a real Postgres.
     #[tokio::test]
