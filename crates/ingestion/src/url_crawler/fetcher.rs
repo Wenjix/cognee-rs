@@ -45,6 +45,10 @@ pub struct UrlFetcher {
     robots_cache: Arc<Mutex<HashMap<String, RobotsCacheEntry>>>,
     /// Per-domain last-fetch timestamp for rate limiting.
     last_fetch: Arc<Mutex<HashMap<String, Instant>>>,
+    /// A proxy is installed: the *proxy* resolves target names, so domain
+    /// targets need an explicit resolution check — [`GuardedResolver`]
+    /// never sees them (M16).
+    proxied: bool,
 }
 
 impl UrlFetcher {
@@ -55,6 +59,15 @@ impl UrlFetcher {
 
     /// Create new fetcher with custom config
     pub fn with_config(config: FetcherConfig) -> Result<Self, UrlFetcherError> {
+        Self::with_config_and_proxies(config, env_proxies())
+    }
+
+    /// [`with_config`] with an explicit proxy list — the production path
+    /// passes [`env_proxies`]; tests inject their own.
+    fn with_config_and_proxies(
+        config: FetcherConfig,
+        proxies: Vec<reqwest::Proxy>,
+    ) -> Result<Self, UrlFetcherError> {
         #[cfg(test)]
         let allow_private = config.allow_private_hosts_for_tests;
         #[cfg(not(test))]
@@ -69,8 +82,8 @@ impl UrlFetcher {
             .dns_resolver(Arc::new(GuardedResolver { allow_private }))
             // System proxies are re-added explicitly by `env_proxies`.
             .no_proxy();
-        for proxy in env_proxies() {
-            builder = builder.proxy(proxy);
+        for proxy in &proxies {
+            builder = builder.proxy(proxy.clone());
         }
         let client = builder
             .build()
@@ -81,6 +94,7 @@ impl UrlFetcher {
             config,
             robots_cache: Arc::new(Mutex::new(HashMap::new())),
             last_fetch: Arc::new(Mutex::new(HashMap::new())),
+            proxied: !proxies.is_empty(),
         })
     }
 
@@ -361,6 +375,36 @@ impl UrlFetcher {
 
         loop {
             check_target_url(&current_url, self.allow_private_hosts())?;
+            // With a proxy in use the target name resolves on the proxy, not
+            // through [`GuardedResolver`] — resolve it here so a domain that
+            // maps to a private/loopback/link-local address is still refused
+            // (M16). A proxy with a different DNS view, or DNS rebinding
+            // between this check and the proxy's own lookup, is not covered:
+            // closing that gap needs an egress proxy that enforces the
+            // policy itself.
+            if self.proxied
+                && !self.allow_private_hosts()
+                && let Some(Host::Domain(domain)) = current_url.host()
+            {
+                let port = current_url.port_or_known_default().unwrap_or(80);
+                let resolved = lookup_host((domain, port)).await.map_err(|e| {
+                    UrlFetcherError::HttpError(format!("could not resolve {domain}: {e}"))
+                })?;
+                let mut any = false;
+                for addr in resolved {
+                    any = true;
+                    if is_blocked_address(normalize_ip(addr.ip())) {
+                        return Err(UrlFetcherError::InvalidUrl(
+                            BlockedHostError(domain.to_string()).to_string(),
+                        ));
+                    }
+                }
+                if !any {
+                    return Err(UrlFetcherError::HttpError(format!(
+                        "could not resolve {domain}: no addresses"
+                    )));
+                }
+            }
             if rate_limited {
                 self.respect_rate_limit(&current_url).await;
             }
@@ -476,8 +520,13 @@ impl std::error::Error for BlockedHostError {}
 ///
 /// Proxies never reach this resolver — [`env_proxies`] hands reqwest their
 /// addresses as IP literals — so it vets every name it sees without exception.
-/// With a proxy in use the target host is resolved by the proxy, so only
-/// IP-literal targets are vetted (by [`check_target_url`]).
+/// With a proxy in use the target host is resolved by the *proxy*, so domain
+/// targets are vetted by an explicit pre-flight resolution in
+/// [`UrlFetcher::send_with_redirects`] instead (IP literals still by
+/// [`check_target_url`]). Residual limit: a proxy with a different DNS view,
+/// or DNS rebinding between that check and the proxy's own lookup, is not
+/// covered — an egress proxy that enforces the policy itself is required
+/// for that.
 struct GuardedResolver {
     allow_private: bool,
 }
@@ -734,5 +783,67 @@ mod tests {
             .await
             .expect("fetch succeeds");
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// A counting "proxy": accepts connections on loopback and records how
+    /// many it saw. Nothing ever completes an HTTP exchange, so any request
+    /// that reaches it would hang — the tests assert it sees zero.
+    fn counting_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        std::thread::spawn(move || {
+            for _ in listener.incoming() {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        (port, count)
+    }
+
+    fn proxied_fetcher(port: u16) -> UrlFetcher {
+        let config = FetcherConfig {
+            respect_robots_txt: false,
+            timeout: Duration::from_millis(200),
+            ..FetcherConfig::default()
+        };
+        let proxy = reqwest::Proxy::http(format!("http://127.0.0.1:{port}")).unwrap();
+        UrlFetcher::with_config_and_proxies(config, vec![proxy]).unwrap()
+    }
+
+    /// M16: with a proxy installed the target name used to resolve only on
+    /// the proxy — a private-mapped domain slipped past GuardedResolver.
+    /// Now the domain is resolved and refused before any proxy connection.
+    #[tokio::test]
+    async fn a_domain_resolving_to_a_blocked_address_never_reaches_the_proxy() {
+        let (port, count) = counting_proxy();
+        let fetcher = proxied_fetcher(port);
+        let err = fetcher.fetch("http://localhost:1/").await.unwrap_err();
+        assert!(
+            matches!(err, UrlFetcherError::InvalidUrl(_)),
+            "expected blocked InvalidUrl, got {err:?}"
+        );
+        // Give any misrouted connection a moment to be seen.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A domain that cannot be resolved at all is a retryable
+    /// `HttpError` — same class as a direct-path DNS failure — and still
+    /// never reaches the proxy.
+    #[tokio::test]
+    async fn an_unresolvable_domain_is_a_retryable_error_not_a_proxy_call() {
+        let (port, count) = counting_proxy();
+        let fetcher = proxied_fetcher(port);
+        let err = fetcher
+            .fetch("http://nonexistent.invalid/")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UrlFetcherError::HttpError(_)),
+            "expected retryable HttpError, got {err:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }
