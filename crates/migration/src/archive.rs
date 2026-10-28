@@ -41,7 +41,7 @@ pub fn pack_archive(
     let mut entries: Vec<PathBuf> = crate::cogx::OWNED_FILES
         .iter()
         .map(|name| archive_dir.join(name))
-        .filter(|path| path.is_file())
+        .filter(|path| path.symlink_metadata().is_ok())
         .collect();
     entries.sort();
 
@@ -58,8 +58,41 @@ pub fn pack_archive(
                 )
             })?
             .to_owned();
+
+        // A planted symlink named like an owned file would otherwise pull
+        // an arbitrary readable file into the tarball — `is_file` and
+        // `append_path_with_name` both follow symlinks.
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(|error| MigrationError::io(&path, error))?;
+        if !meta.file_type().is_file() {
+            return Err(MigrationError::io(
+                &path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to archive a symlink or non-regular file",
+                ),
+            ));
+        }
+        let mut file = File::open(&path).map_err(|error| MigrationError::io(&path, error))?;
+        // Close the swap race: the opened handle must be the lstat'd entry.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let opened = file
+                .metadata()
+                .map_err(|error| MigrationError::io(&path, error))?;
+            if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+                return Err(MigrationError::io(
+                    &path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "refusing to archive a symlink or non-regular file",
+                    ),
+                ));
+            }
+        }
         builder
-            .append_path_with_name(&path, &name)
+            .append_file(&name, &mut file)
             .map_err(|error| MigrationError::io(&path, error))?;
     }
 
@@ -104,5 +137,50 @@ mod tests {
             "manifest is not at the tarball root: {names:?}"
         );
         assert!(names.contains(&"entities.jsonl".to_string()));
+    }
+
+    /// A planted symlink named like an owned file must abort the pack
+    /// instead of pulling the link target into the tarball.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_owned_file_aborts_the_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(archive.join(MANIFEST_FILE), "{}").unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "should never ship").unwrap();
+        std::os::unix::fs::symlink(&secret, archive.join("entities.jsonl")).unwrap();
+
+        let result = pack_archive(&archive, dir.path().join("out.cogx.tar.gz"));
+        assert!(result.is_err(), "packing a symlinked owned file must fail");
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "should never ship"
+        );
+    }
+
+    /// An export whose destination already holds a symlink at an owned
+    /// record-file name must error rather than write through it. The symlink
+    /// is planted *after* `new()` — the constructor legitimately unlinks
+    /// owned names, so a pre-construction plant never reaches the write
+    /// path; the post-construction window is the real attack.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_in_the_export_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("export");
+        std::fs::create_dir_all(&out).unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+
+        let mut writer = crate::cogx::CogxArchiveWriter::new(&out).unwrap();
+        // Plant the symlink after the constructor cleaned the owned names —
+        // O_EXCL must refuse to open it.
+        std::os::unix::fs::symlink(&victim, out.join("nodes.jsonl")).unwrap();
+
+        let result = writer.write_raw_node(&serde_json::json!({"id": 1}));
+        assert!(result.is_err(), "export must refuse the planted symlink");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     }
 }
