@@ -106,11 +106,28 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "api-key",
 ];
 
-/// Bytes that end a URL authority or a `key=value` value. `\\` and `"` cover
-/// text that went through a `Debug` string escape.
-const VALUE_END: &[u8] = b"&;,)}\"'\\ \t\r\n";
 /// Bytes after which a `key=` may start.
 const PARAM_START: &[u8] = b"?&;,({\"' \t\r\n";
+
+/// The byte at `i` ends a URL authority: `/`, `?`, `#`, ASCII whitespace, or
+/// an unescaped `"` (one not preceded by `\`, so a Debug-escaped `\"` does
+/// not end it early). `;`, `,`, `)`, `}`, `'` and `\` are legal inside
+/// credentials — they must NOT terminate, or `pa;ss` would leak `;ss`
+/// unmasked.
+fn url_authority_ends(bytes: &[u8], i: usize) -> bool {
+    let b = bytes[i];
+    b"/?#".contains(&b)
+        || b.is_ascii_whitespace()
+        || (b == b'"' && (i == 0 || bytes[i - 1] != b'\\'))
+}
+
+/// The byte at `i` ends an unquoted `key=value` value: ASCII whitespace,
+/// `&`, or an unescaped `"`. `;`, `,`, `)`, `}` no longer terminate —
+/// over-masking an adjacent token is acceptable, leaking is not.
+fn param_value_ends(bytes: &[u8], i: usize) -> bool {
+    let b = bytes[i];
+    b.is_ascii_whitespace() || b == b'&' || (b == b'"' && (i == 0 || bytes[i - 1] != b'\\'))
+}
 
 /// `text` with the credentials embedded in it replaced by [`REDACTED`]:
 ///
@@ -144,6 +161,32 @@ pub fn redact_credentials(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// [`redact_credentials`] applied to every string inside `value`, in place:
+/// objects and arrays recurse, every other type is untouched. Masked
+/// configuration snapshots are the intended consumer — a non-secret
+/// connection string (`postgres://u:pw@h`, `redis://:pw@h`, `?password=`)
+/// must not keep its embedded password on display either.
+pub fn redact_json_credentials(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Cow::Owned(masked) = redact_credentials(s) {
+                *s = masked;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_credentials(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_json_credentials(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Every `scheme://user:password@` password replaced by [`REDACTED`].
 fn redact_url_passwords(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
@@ -152,10 +195,9 @@ fn redact_url_passwords(text: &str) -> Cow<'_, str> {
     let mut search = 0;
     while let Some(found) = text[search..].find("://") {
         let start = search + found + 3;
-        let end = bytes[start..]
-            .iter()
-            .position(|b| b"/?#".contains(b) || VALUE_END.contains(b))
-            .map_or(bytes.len(), |n| start + n);
+        let end = (start..bytes.len())
+            .find(|&i| url_authority_ends(bytes, i))
+            .unwrap_or(bytes.len());
         search = end.max(start);
         let authority = &text[start..end];
         let Some(at) = authority.rfind('@') else {
@@ -212,10 +254,9 @@ fn redact_params(text: &str) -> Cow<'_, str> {
                 .position(|b| *b == b'\'')
                 .map_or(bytes.len(), |p| value_start + 1 + p + 1)
         } else {
-            bytes[value_start..]
-                .iter()
-                .position(|b| VALUE_END.contains(b))
-                .map_or(bytes.len(), |p| value_start + p)
+            (value_start..bytes.len())
+                .find(|&i| param_value_ends(bytes, i))
+                .unwrap_or(bytes.len())
         };
         if value_end > value_start && &text[value_start..value_end] != REDACTED {
             let buf = out.get_or_insert_with(String::new);
@@ -343,5 +384,85 @@ mod tests {
             "Some(\"\")"
         );
         assert_eq!(format!("{:?}", Redacted(&"x".to_string())), REDACTED);
+    }
+
+    #[test]
+    fn passwords_with_reserved_characters_are_masked_in_urls() {
+        // `; , ) } & '` are legal password bytes: they must not end the
+        // userinfo scan early and leak a suffix unmasked.
+        for url in [
+            "postgres://u:pa;ss@h/db",
+            "postgres://u:pa,ss@h/db",
+            "postgres://u:pa)ss@h/db",
+            "postgres://u:pa}ss@h/db",
+            "postgres://u:pa&ss@h/db",
+            "postgres://u:pa'ss@h/db",
+        ] {
+            let out = redact_credentials(url);
+            assert!(out.contains(REDACTED), "{url} -> {out}");
+            assert!(!out.contains("pa"), "{url} -> {out}");
+            assert!(out.contains("@h/db"), "{url} -> {out}");
+        }
+        // A trailing backslash before the host separator keeps masking too.
+        let out = redact_credentials("postgres://u:pa\\ss@h/db");
+        assert!(out.contains(REDACTED), "{out}");
+    }
+
+    #[test]
+    fn passwords_with_reserved_characters_are_masked_in_params() {
+        for text in [
+            "password=pa;ss",
+            "password=pa,ss",
+            "password=pa)ss",
+            "password=pa}ss",
+            "password=pa'ss x",
+            "pwd=pa\\ss y",
+        ] {
+            let out = redact_credentials(text);
+            assert!(out.contains(REDACTED), "{text} -> {out}");
+        }
+    }
+
+    #[test]
+    fn debug_escaped_output_keeps_masking() {
+        // `{:?}`/`{:#?}` escape `"` and `\`: the escaped quote must not end a
+        // credential scan before the password.
+        let s = Some(String::from("postgres://u:pw@h/db"));
+        let out = redact_credentials(&format!("{s:?}")).into_owned();
+        assert!(out.contains(REDACTED), "{out}");
+        assert!(!out.contains("pw@"), "{out}");
+        let out = redact_credentials(&format!("{s:#?}")).into_owned();
+        assert!(out.contains(REDACTED), "{out}");
+
+        // And through `CredentialSafe`'s Debug, which escapes the string.
+        let url = "postgres://u:pw@h/db".to_string();
+        let safe = CredentialSafe(&url);
+        let out = redact_credentials(&format!("{safe:?}")).into_owned();
+        assert!(!out.contains("pw@"), "{out}");
+    }
+
+    #[test]
+    fn json_text_keeps_host_and_unrelated_at_signs() {
+        let out = redact_credentials(r#"{"url":"postgres://u:p@ss;w@h/db","e":"a@b"}"#);
+        assert!(out.contains(REDACTED), "{out}");
+        assert!(!out.contains("p@ss"), "{out}");
+        // The JSON punctuation and the harmless `a@b` string are untouched.
+        assert!(out.contains("a@b"), "{out}");
+        assert!(out.contains("@h"), "{out}");
+    }
+
+    #[test]
+    fn redact_json_credentials_walks_nested_values() {
+        let mut v = json!({
+            "url": "postgres://u:pw@h/db",
+            "list": ["redis://:pw@h", 42, null],
+            "plain": "nothing",
+        });
+        redact_json_credentials(&mut v);
+        let s = v.to_string();
+        assert!(s.contains(REDACTED), "{s}");
+        assert!(!s.contains("pw@"), "{s}");
+        assert_eq!(v["list"][1], json!(42));
+        assert_eq!(v["plain"], json!("nothing"));
     }
 }

@@ -594,13 +594,20 @@ impl ConfigSchema {
     /// its default), keyed canonically. With `mask = Some(marker)`, every
     /// secret that is set ([`secret_is_set`](crate::secret_is_set): not null
     /// and not `""`) is replaced by `marker`; an unset one keeps its `null` or
-    /// `""`.
+    /// `""`. Masked snapshots also run every non-secret value through
+    /// [`redact_json_credentials`](crate::redact_json_credentials) so an
+    /// ordinary connection string cannot keep an embedded password.
     pub fn snapshot(&self, values: &ConfigValues, mask: Option<&str>) -> ConfigValues {
         self.key_defs()
             .map(|def| {
                 let value = values.get(def.key).cloned().unwrap_or_else(def.default);
                 let shown = match mask {
                     Some(marker) if def.secret => crate::mask_secret(value, marker),
+                    Some(_) => {
+                        let mut value = value;
+                        crate::redact_json_credentials(&mut value);
+                        value
+                    }
                     _ => value,
                 };
                 (def.key.to_string(), shown)
