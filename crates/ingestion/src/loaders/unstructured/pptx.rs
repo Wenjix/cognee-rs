@@ -4,7 +4,7 @@
 //! files, and extracts text from `<a:t>` elements. Slides are joined
 //! with `"\n\n"`.
 
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
@@ -16,6 +16,10 @@ const DRAWINGML_NS: &[u8] = b"http://schemas.openxmlformats.org/drawingml/2006/m
 
 /// Extract text from a PPTX file.
 pub(crate) fn extract(bytes: &[u8]) -> Result<String, LoaderError> {
+    extract_with_limit(bytes, super::super::MAX_EXTRACTED_BYTES)
+}
+
+fn extract_with_limit(bytes: &[u8], limit: usize) -> Result<String, LoaderError> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| LoaderError::ExtractionFailed(format!("Failed to open PPTX as ZIP: {e}")))?;
@@ -41,17 +45,16 @@ pub(crate) fn extract(bytes: &[u8]) -> Result<String, LoaderError> {
     });
 
     let mut elements: Vec<String> = Vec::new();
+    // One decompression budget across every slide (see M14).
+    let mut budget = limit;
 
     for slide_name in &slide_names {
-        let mut xml_content = String::new();
-        {
-            let mut file = archive.by_name(slide_name).map_err(|e| {
+        let xml_content = {
+            let file = archive.by_name(slide_name).map_err(|e| {
                 LoaderError::ExtractionFailed(format!("Failed to read {slide_name}: {e}"))
             })?;
-            file.read_to_string(&mut xml_content).map_err(|e| {
-                LoaderError::ExtractionFailed(format!("Failed to read {slide_name}: {e}"))
-            })?;
-        }
+            super::read_entry_to_string(file, slide_name, &mut budget)?
+        };
 
         let slide_text = parse_slide_xml(&xml_content)?;
         let trimmed = slide_text.trim().to_string();
@@ -186,5 +189,23 @@ mod tests {
     fn empty_bytes_returns_error() {
         let result = extract(b"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_decompressed_slide_past_the_limit_is_rejected() {
+        let big = vec![b' '; 2_000_000];
+        let zip = super::super::zip_bytes(&[("ppt/slides/slide1.xml", big.as_slice())]);
+        assert!(matches!(
+            extract_with_limit(&zip, 1_000_000),
+            Err(LoaderError::ExtractionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn a_small_document_extracts_exactly_as_before() {
+        let xml = br#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>hi there</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let zip = super::super::zip_bytes(&[("ppt/slides/slide1.xml", xml)]);
+        let text = extract_with_limit(&zip, 1_000_000).unwrap();
+        assert!(text.contains("hi there"), "{text:?}");
     }
 }
