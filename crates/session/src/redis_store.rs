@@ -716,7 +716,21 @@ mod tests {
             session_feedback: String::new(),
         };
 
-        let store = RedisSessionStore::new(&url).await.unwrap();
+        // Logical database 15, not the shared default: `prune()` deletes
+        // every session key on its database and would race the other
+        // redis-backed tests running against the same throwaway server.
+        let mut info = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_connection_info()
+            .clone();
+        info.redis.db = 15;
+        let store = RedisSessionStore::from_connection(
+            redis::Client::open(info.clone())
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap(),
+        );
         for sid in [&s1, &s2] {
             store
                 .create_qa_entry(sid, Some(&user), "q", "a", None)
@@ -768,8 +782,8 @@ mod tests {
                 .is_empty()
         );
         assert!(store.read_trace_steps(&user, &s2).await.unwrap().is_empty());
-        // Paranoia: no trace keys of ours survive anywhere.
-        let mut conn = redis::Client::open(url.as_str())
+        // Paranoia: no trace keys of ours survive anywhere (on db 15).
+        let mut conn = redis::Client::open(info)
             .unwrap()
             .get_multiplexed_async_connection()
             .await

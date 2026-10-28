@@ -43,8 +43,8 @@ pub trait SessionQaDb: Send + Sync {
         user_id: Option<&str>,
     ) -> Result<Vec<SessionQaRow>, DatabaseError>;
 
-    /// Delete the session's entries and graph context; returns the number of
-    /// entries removed.
+    /// Delete the session's entries, graph context and agent-trace steps;
+    /// returns the number of QA entries removed.
     async fn delete_session_qa(
         &self,
         session_id: &str,
@@ -59,7 +59,8 @@ pub trait SessionQaDb: Send + Sync {
         qa_id: &str,
     ) -> Result<bool, DatabaseError>;
 
-    /// Delete every entry and graph context of every session.
+    /// Delete every entry, graph context and agent-trace step of every
+    /// session.
     async fn delete_all_session_qa(&self) -> Result<(), DatabaseError>;
 
     /// Apply `patch` to one entry; whether it existed.

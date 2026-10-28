@@ -112,6 +112,16 @@ impl FsSessionStore {
 /// followed by its percent-encoding (`%` and every unsafe character escaped as
 /// `%XX` per UTF-8 byte); a raw name never starts with `%`, so the mapping is
 /// injective.
+///
+/// The three on-disk layouts — `{c}.json` (QA), `{c}.traces.json` (trace
+/// steps) and `_graph_context_{c}.json` (graph context) — also force the
+/// `.traces` suffix and `_graph_context_` prefix to encode: raw names never
+/// end with `.traces`, never start with `_graph_context_` or `%`, and an
+/// encoded name starts with `%` and contains no `.` or `_` at all, so no QA
+/// name can equal a trace or context name (and those two cannot collide
+/// either). Without that, session `s`'s trace file would be session
+/// `s.traces`'s QA file — and `delete_session("s")` would erase another
+/// session's data.
 fn path_component(id: &str) -> Cow<'_, str> {
     fn is_unsafe_char(c: char) -> bool {
         if c == '/' || c == '\0' {
@@ -128,6 +138,8 @@ fn path_component(id: &str) -> Cow<'_, str> {
         || id == "."
         || id == ".."
         || id.starts_with('%')
+        || id.ends_with(".traces")
+        || id.starts_with("_graph_context_")
         || id.chars().any(is_unsafe_char);
     if !unsafe_id {
         return Cow::Borrowed(id);
@@ -135,7 +147,10 @@ fn path_component(id: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(id.len() + 1);
     out.push('%');
     for c in id.chars() {
-        if c == '%' || is_unsafe_char(c) {
+        // `.` and `_` escape in the encoded form too: that way an encoded
+        // name contains neither, so no encoded QA/trace/context name can
+        // alias another layout's name (see the doc comment).
+        if c == '%' || c == '.' || c == '_' || is_unsafe_char(c) {
             let mut buf = [0u8; 4];
             for b in c.encode_utf8(&mut buf).as_bytes() {
                 out.push_str(&format!("%{b:02X}"));
@@ -357,14 +372,32 @@ impl SessionStore for FsSessionStore {
             Err(e) => return Err(SessionError::StoreError(format!("fs delete error: {e}"))),
         };
 
-        // Also remove the graph context file for this session (best-effort).
+        // Also remove the graph context file for this session. NotFound is
+        // the only tolerable miss — anything else means erasure is
+        // incomplete and must not report success.
         let gc_path = graph_context_file(&self.base_dir, user_id, session_id);
-        let _ = fs::remove_file(&gc_path).await; // ignore NotFound
+        match fs::remove_file(&gc_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SessionError::StoreError(format!(
+                    "fs delete graph-context error: {e}"
+                )));
+            }
+        }
 
-        // And the agent-trace file (same best-effort semantics).
+        // And the agent-trace file (same NotFound-only semantics).
         let trace_path =
             trace_session_file(&self.base_dir, user_id.unwrap_or("default"), session_id);
-        let _ = fs::remove_file(&trace_path).await; // ignore NotFound
+        match fs::remove_file(&trace_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SessionError::StoreError(format!(
+                    "fs delete trace-file error: {e}"
+                )));
+            }
+        }
 
         Ok(existed)
     }
@@ -938,6 +971,10 @@ mod tests {
             "日本/語",
             "x\0y",
             "user%40x",
+            // The layout-ambiguity triggers, plus a safe id with `.`/`_`.
+            "s.traces",
+            "_graph_context_s",
+            "a.b_c",
         ] {
             assert_eq!(decode(&path_component(id)), id, "{id:?}");
         }
@@ -951,6 +988,79 @@ mod tests {
                 .map(|s| session_file(Path::new("/b"), Some("u"), s))
                 .collect();
         assert_eq!(names.len(), 9);
+    }
+
+    /// The three file layouts of every id — `{c}.json`, `{c}.traces.json`,
+    /// `_graph_context_{c}.json` — must never alias one another, or one
+    /// session's trace/context file is another's QA file and erasure of the
+    /// one deletes the other's data.
+    #[test]
+    fn qa_trace_and_context_names_never_collide() {
+        let base = Path::new("/b");
+        let mut all = std::collections::HashSet::new();
+        for sid in ["s", "s.traces", "_graph_context_s", "%s", "%s.traces"] {
+            assert!(all.insert(session_file(base, Some("u"), sid)), "QA {sid}");
+            assert!(
+                all.insert(trace_session_file(base, "u", sid)),
+                "trace {sid}"
+            );
+            assert!(
+                all.insert(graph_context_file(base, Some("u"), sid)),
+                "context {sid}"
+            );
+        }
+        assert_eq!(all.len(), 15);
+    }
+
+    /// `delete_session("s")` removes s's trace file — which without the
+    /// `.traces` encoding rule is session `s.traces`'s QA file.
+    #[tokio::test]
+    async fn delete_session_leaves_traces_suffixed_sessions_qa_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        store
+            .create_qa_entry("s", Some("u1"), "q1", "a1", None)
+            .await
+            .unwrap();
+        store
+            .create_qa_entry("s.traces", Some("u1"), "q2", "a2", None)
+            .await
+            .unwrap();
+        store
+            .save_trace_step(
+                "u1",
+                "s",
+                crate::types::SessionTraceStep {
+                    trace_id: "t".to_string(),
+                    origin_function: "f".to_string(),
+                    status: "success".to_string(),
+                    memory_query: String::new(),
+                    memory_context: String::new(),
+                    method_params: serde_json::json!({}),
+                    method_return_value: None,
+                    error_message: String::new(),
+                    session_feedback: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(store.delete_session("s", Some("u1")).await.unwrap());
+
+        let survivor = store
+            .get_all_qa_entries("s.traces", Some("u1"))
+            .await
+            .unwrap();
+        assert_eq!(survivor.len(), 1, "the other session's QA entry must stay");
+        assert_eq!(survivor[0].question, "q2");
+        assert!(
+            store
+                .get_all_qa_entries("s", Some("u1"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.read_trace_steps("u1", "s").await.unwrap().is_empty());
     }
 
     #[tokio::test]
