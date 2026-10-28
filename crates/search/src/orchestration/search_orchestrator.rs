@@ -804,6 +804,20 @@ impl SearchOrchestrator {
         // A retriever whose results are not dataset data (feedback analysis)
         // reads no store, so it is never fanned out.
         if !self.per_dataset_storage || scoping == DatasetScoping::NotDatasetData {
+            // Fail closed (M25): with an ACL attached but the shared store, an
+            // unscoped search returns content of datasets the caller cannot
+            // read — Python refuses this combination at startup. The check
+            // sits after authorization and name resolution so those paths
+            // keep their current errors, and a NotDatasetData retriever still
+            // runs: it reads no dataset data.
+            if self.acl_db.is_some() && scoping != DatasetScoping::NotDatasetData {
+                return Err(SearchError::InvalidInput(
+                    "access control (an attached AclDb) requires per-dataset storage \
+                     (ENABLE_BACKEND_ACCESS_CONTROL=true): the shared graph and vector \
+                     stores cannot limit results to the datasets the caller may read"
+                        .into(),
+                ));
+            }
             // The shared store: one unscoped search, whatever datasets the
             // request names, after the permission check above. Python's
             // non-ACL branch (`search.py:455-505`): no dataset context, and the
@@ -2850,9 +2864,12 @@ mod tests {
 
         let mut registry = SearchTypeRegistry::new();
         registry.register(Arc::new(FakeChunksRetriever));
+        // Per-dataset storage: an ACL over the shared store is refused
+        // outright (M25) — this test is about authorization, not storage.
         let orchestrator = super::SearchOrchestrator::new(registry)
             .with_dataset_resolver(db as Arc<dyn IngestDb>)
-            .with_acl_db(mock as Arc<dyn cognee_database::AclDb>);
+            .with_acl_db(mock as Arc<dyn cognee_database::AclDb>)
+            .with_per_dataset_storage(true);
 
         let request = SearchRequest {
             datasets: Some(vec!["granted".into()]),
@@ -3088,8 +3105,11 @@ mod tests {
             dataset_a: granted,
             dataset_b: ungranted,
         }));
-        let orchestrator =
-            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+        // Per-dataset storage: an ACL over the shared store is refused
+        // outright (M25) — this test is about tenant scoping of grants.
+        let orchestrator = super::SearchOrchestrator::new(registry)
+            .with_acl_db(acl as Arc<dyn AclDb>)
+            .with_per_dataset_storage(true);
 
         for id in [granted, ungranted] {
             let err = orchestrator
@@ -3568,9 +3588,12 @@ mod tests {
 
         let mut registry = SearchTypeRegistry::new();
         registry.register(Arc::new(FakeChunksRetriever));
-        // Intentionally no .with_dataset_resolver(...).
-        let orchestrator =
-            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+        // Intentionally no .with_dataset_resolver(...). Per-dataset storage:
+        // an ACL over the shared store is refused outright (M25) — this test
+        // is about authorization without a resolver.
+        let orchestrator = super::SearchOrchestrator::new(registry)
+            .with_acl_db(acl as Arc<dyn AclDb>)
+            .with_per_dataset_storage(true);
 
         let denied = orchestrator
             .search(&SearchRequest {
@@ -3907,42 +3930,119 @@ mod tests {
 
     /// A type whose results carry no dataset membership (temporal, Cypher,
     /// lexical, …) is no longer refused under an ACL: nothing is filtered by
-    /// membership any more. Over the shared store it runs once, unscoped;
-    /// under per-dataset storage once per dataset, in that dataset's scope.
+    /// membership any more. Under per-dataset storage it runs once per
+    /// dataset, in that dataset's scope. Over the shared store an ACL is
+    /// refused outright (M25): the unscoped answer could contain data of
+    /// datasets the caller cannot read.
     #[tokio::test]
     async fn an_unscopable_type_runs_under_an_acl() {
         let caller = Uuid::new_v4();
         let readable = Uuid::new_v4();
-        for per_dataset in [false, true] {
-            let acl = Arc::new(cognee_test_utils::MockAclDb::new());
-            acl.grant_permission(caller, readable, "read")
+
+        // Shared store + ACL: refused before the retriever runs.
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(caller, readable, "read")
+            .await
+            .expect("grant");
+        let (orchestrator, retriever) = scoping_orchestrator(
+            crate::retrievers::DatasetScoping::Unsupported,
+            Some(acl as Arc<dyn AclDb>),
+        );
+        let err = orchestrator
+            .search(&SearchRequest {
+                search_type: SearchType::Temporal,
+                dataset_ids: Some(vec![readable]),
+                user_id: Some(caller),
+                only_context: Some(false),
+                ..dataset_request_template()
+            })
+            .await
+            .expect_err("ACL over the shared store is refused");
+        assert!(matches!(err, SearchError::InvalidInput(_)), "got {err:?}");
+        assert_eq!(retriever.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Per-dataset storage + ACL: unchanged — runs once per dataset.
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(caller, readable, "read")
+            .await
+            .expect("grant");
+        let (orchestrator, retriever) = scoping_orchestrator(
+            crate::retrievers::DatasetScoping::Unsupported,
+            Some(acl as Arc<dyn AclDb>),
+        );
+        let orchestrator = orchestrator.with_per_dataset_storage(true);
+        for dataset_ids in [None, Some(vec![readable])] {
+            let response = orchestrator
+                .search(&SearchRequest {
+                    search_type: SearchType::Temporal,
+                    dataset_ids: dataset_ids.clone(),
+                    user_id: Some(caller),
+                    only_context: Some(false),
+                    ..dataset_request_template()
+                })
                 .await
-                .expect("grant");
-            let (orchestrator, retriever) = scoping_orchestrator(
-                crate::retrievers::DatasetScoping::Unsupported,
-                Some(acl as Arc<dyn AclDb>),
+                .expect("no type is refused under per-dataset storage");
+            assert_eq!(
+                item_texts(&response.result),
+                vec!["no membership".to_string()],
+                "dataset_ids={dataset_ids:?}"
             );
-            let orchestrator = orchestrator.with_per_dataset_storage(per_dataset);
-            for dataset_ids in [None, Some(vec![readable])] {
-                let response = orchestrator
-                    .search(&SearchRequest {
-                        search_type: SearchType::Temporal,
-                        dataset_ids: dataset_ids.clone(),
-                        user_id: Some(caller),
-                        only_context: Some(false),
-                        ..dataset_request_template()
-                    })
-                    .await
-                    .expect("no type is refused");
-                assert_eq!(
-                    item_texts(&response.result),
-                    vec!["no membership".to_string()],
-                    "per_dataset={per_dataset} dataset_ids={dataset_ids:?}"
-                );
-            }
-            assert!(retriever.calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
-            assert!(!orchestrator.refuses_dataset_scope(SearchType::Temporal));
         }
+        assert!(retriever.calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(!orchestrator.refuses_dataset_scope(SearchType::Temporal));
+    }
+
+    /// M25: an authorized caller still cannot search the shared store under
+    /// an ACL — the unscoped answer cannot be limited to readable datasets.
+    #[tokio::test]
+    async fn acl_over_the_shared_store_is_refused_for_authorized_callers() {
+        let caller = Uuid::new_v4();
+        let readable = Uuid::new_v4();
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(caller, readable, "read")
+            .await
+            .expect("grant");
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(FakeChunksRetriever));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+
+        let err = orchestrator
+            .search(&SearchRequest {
+                dataset_ids: Some(vec![readable]),
+                user_id: Some(caller),
+                ..dataset_request_template()
+            })
+            .await
+            .expect_err("ACL + shared store is refused even when authorized");
+        assert!(matches!(err, SearchError::InvalidInput(_)), "got {err:?}");
+    }
+
+    /// M25: a retriever that reads no dataset data (feedback) still runs on
+    /// the shared store under an ACL — it cannot leak what it never reads.
+    #[tokio::test]
+    async fn a_not_dataset_data_retriever_still_runs_on_the_shared_store() {
+        let caller = Uuid::new_v4();
+        let readable = Uuid::new_v4();
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(caller, readable, "read")
+            .await
+            .expect("grant");
+        let (orchestrator, retriever) = scoping_orchestrator(
+            crate::retrievers::DatasetScoping::NotDatasetData,
+            Some(acl as Arc<dyn AclDb>),
+        );
+        orchestrator
+            .search(&SearchRequest {
+                search_type: SearchType::Temporal,
+                dataset_ids: Some(vec![readable]),
+                user_id: Some(caller),
+                only_context: Some(false),
+                ..dataset_request_template()
+            })
+            .await
+            .expect("NotDatasetData reads nothing, so it still runs");
+        assert!(retriever.calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 
     /// The same unscopable type without an ACL: unchanged, unscoped.
