@@ -29,7 +29,8 @@ use std::collections::BTreeMap;
 pub mod redact;
 pub mod section;
 pub use redact::{
-    CredentialSafe, REDACTED, Redacted, mask_secret, redact_credentials, secret_is_set,
+    CredentialSafe, REDACTED, Redacted, mask_secret, redact_credentials, redact_json_credentials,
+    secret_is_set,
 };
 pub use section::{
     ConfigSchema, ConfigSection, ConfigValue, ConfigValues, KeyDef, KeyError, LenientReport,

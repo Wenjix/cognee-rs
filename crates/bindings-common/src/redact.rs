@@ -255,4 +255,29 @@ mod tests {
         assert_eq!(value["test.redact.api_key"], json!(REDACTED));
         assert_eq!(value["test.redact.model"], json!("m"));
     }
+
+    /// Non-secret connection strings must not keep an embedded password in
+    /// the masked snapshot (M07/M10): `postgres://u:pw@h` and `?password=`
+    /// are stripped while the host and database survive.
+    #[test]
+    fn connection_strings_lose_their_embedded_credentials() {
+        let cm = cognee::config::ConfigManager::new(cognee::config::Settings::default());
+        cm.set(
+            "relational.url",
+            json!("postgres://u:hunter2@db:5432/cognee"),
+        )
+        .expect("relational.url takes a string");
+        cm.set("graph.url", json!("postgres://g:pw@graph:5432/g"))
+            .expect("graph.url takes a string");
+        let value = config_snapshot(&cm);
+        let rendered = value.to_string();
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("g:pw@"), "{rendered}");
+        assert_eq!(
+            value["relational.url"],
+            json!("postgres://u:***REDACTED***@db:5432/cognee")
+        );
+        // Unset values are untouched.
+        assert_eq!(value["llm.api_key"], json!(""));
+    }
 }

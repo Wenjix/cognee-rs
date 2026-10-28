@@ -28,7 +28,7 @@ fn patterns() -> &'static [Regex] {
     SECRET_PATTERNS
         .get_or_init(|| {
             vec![
-                Regex::new(r"sk-[A-Za-z0-9]{20,}")
+                Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}")
                     .expect("openai-key pattern compiles (build-time guarantee)"),
                 Regex::new(r#"(?i)(api[_-]?key\s*[=:]\s*)['"]?[A-Za-z0-9\-_]{16,}['"]?"#)
                     .expect("api-key pattern compiles (build-time guarantee)"),
@@ -130,5 +130,38 @@ mod tests {
         // Touches the OnceLock initializer — guards against a regex typo
         // landing without a compile-time signal.
         let _ = patterns();
+    }
+
+    #[test]
+    fn redacts_project_and_service_account_keys() {
+        // Project / service-account keys contain `-` and `_` inside the key
+        // body — the old `[A-Za-z0-9]` pattern stopped at the first dash.
+        let proj = "sk-proj-AbCdEf_12345-XYZ";
+        let out = redact(proj);
+        assert!(out.contains("sk-pro"), "{out}");
+        assert!(!out.contains("AbCdEf"), "{out}");
+
+        let svc = "sk-svcacct-A1B2C3D4E5F6G7H8";
+        let out = redact(svc);
+        assert!(out.contains("sk-svc"), "{out}");
+        assert!(!out.contains("C3D4"), "{out}");
+    }
+
+    #[test]
+    fn sk_pattern_does_not_match_inside_hyphenated_words() {
+        // Without the word boundary, `task-…` contains `sk-` mid-word.
+        assert!(matches!(
+            redact("task-identifier-something-long"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            redact("desk-top-something-quite-long"),
+            Cow::Borrowed(_)
+        ));
+        // Real keys at a word boundary still mask.
+        let out = redact("key=sk-proj-AbCdEf_12345-XYZ");
+        assert!(!out.contains("AbCdEf"), "{out}");
+        let out = redact("Bearer:sk-svcacct-A1B2C3D4E5F6G7H8");
+        assert!(!out.contains("C3D4"), "{out}");
     }
 }

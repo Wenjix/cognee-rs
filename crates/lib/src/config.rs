@@ -1278,6 +1278,12 @@ impl ConfigManager {
                 map.insert(key, v);
             }
         }
+        // Masked snapshots also strip credentials embedded in non-secret
+        // strings (`postgres://u:pw@h`, `?password=`). `snapshot(None)`
+        // stays byte-identical.
+        if mask.is_some() {
+            cognee_config_core::redact_json_credentials(&mut value);
+        }
         value
     }
 
