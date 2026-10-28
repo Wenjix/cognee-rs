@@ -83,14 +83,10 @@ fn read_entry_to_string(
     budget: &mut usize,
 ) -> Result<String, EntryReadError> {
     let mut bytes = Vec::new();
-    entry
-        .take(*budget as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| {
-            EntryReadError::Read(LoaderError::ExtractionFailed(format!(
-                "Failed to read '{name}': {e}"
-            )))
-        })?;
+    // `read_to_end` keeps partial bytes in `bytes` on an I/O error — charge
+    // them (and enforce the limit) either way, so a document of many
+    // corrupt entries cannot each decompress up to the remaining budget.
+    let read_result = entry.take(*budget as u64 + 1).read_to_end(&mut bytes);
     if bytes.len() > *budget {
         return Err(EntryReadError::LimitExceeded(
             LoaderError::ExtractionFailed(format!(
@@ -99,6 +95,11 @@ fn read_entry_to_string(
         ));
     }
     *budget -= bytes.len();
+    read_result.map_err(|e| {
+        EntryReadError::Read(LoaderError::ExtractionFailed(format!(
+            "Failed to read '{name}': {e}"
+        )))
+    })?;
     String::from_utf8(bytes).map_err(|e| {
         EntryReadError::Read(LoaderError::ExtractionFailed(format!(
             "Failed to read '{name}': {e}"
@@ -243,7 +244,40 @@ pub(super) fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
 mod tests {
     use super::*;
     use cognee_models::DataPoint;
+    use std::io;
     use uuid::Uuid;
+
+    /// Yields `fail_after` bytes then an I/O error — for the budget test.
+    struct FailAfterN {
+        remaining: usize,
+    }
+
+    impl Read for FailAfterN {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom"));
+            }
+            let n = self.remaining.min(buf.len());
+            buf[..n].fill(b'x');
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    /// An I/O error after a partial read must still charge the bytes it
+    /// decompressed — otherwise a document of corrupt entries can expand far
+    /// past the budget (R-bot feedback on M14).
+    #[cfg(feature = "unstructured-epub")]
+    #[test]
+    fn a_failed_entry_read_still_charges_its_bytes() {
+        let mut budget = 1_000usize;
+        let result = read_entry_to_string(FailAfterN { remaining: 300 }, "x", &mut budget);
+        assert!(
+            matches!(result, Err(EntryReadError::Read(_))),
+            "expected a non-limit read error"
+        );
+        assert_eq!(budget, 700, "the 300 partially-read bytes must be charged");
+    }
 
     fn make_doc(ext: &str) -> Document {
         Document {

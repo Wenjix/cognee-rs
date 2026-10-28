@@ -54,8 +54,9 @@ fn csv_rows_with_limit(bytes: &[u8], limit: usize) -> Result<Vec<String>, Loader
             .map(|(col, val)| format!("{col}: {val}"))
             .collect();
         let row = pairs.join(", ");
-        // The row itself plus the `"\n\n"` separator the pipeline inserts.
-        produced += row.len() + 2;
+        // The row itself plus the `"\n\n"` separator the pipeline inserts
+        // BETWEEN rows — nothing trails the last row.
+        produced += row.len() + if rows.is_empty() { 0 } else { 2 };
         if produced > limit {
             return Err(LoaderError::ExtractionFailed(format!(
                 "csv output exceeds the {limit}-byte extraction limit"
@@ -191,5 +192,24 @@ mod tests {
             .expect("within the limit");
         assert_eq!(rows.len(), 1_000);
         assert!(rows[0].starts_with(&format!("{header}: v")));
+    }
+
+    #[test]
+    fn output_exactly_at_the_limit_is_accepted() {
+        // `"\n\n"` joins only BETWEEN rows — the last row carries no
+        // separator, so output whose joined length equals the cap passes.
+        let csv = "a,b\nx,y\np,q\n";
+        let expected_len = csv_rows_with_limit(csv.as_bytes(), 10_000)
+            .unwrap()
+            .join("\n\n")
+            .len();
+        assert!(
+            csv_rows_with_limit(csv.as_bytes(), expected_len).is_ok(),
+            "joined output of {expected_len} bytes must pass a {expected_len} cap"
+        );
+        assert!(
+            csv_rows_with_limit(csv.as_bytes(), expected_len - 1).is_err(),
+            "one byte over the cap must fail"
+        );
     }
 }
