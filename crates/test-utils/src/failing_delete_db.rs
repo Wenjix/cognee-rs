@@ -208,6 +208,37 @@ impl DeleteDb for FailingDeleteDb {
         DeleteDb::get_node_slugs_with_claims(self.inner.as_ref(), slugs).await
     }
 
+    async fn get_nodes_unique_to_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        DeleteDb::get_nodes_unique_to_scope(self.inner.as_ref(), dataset_ids, pairs).await
+    }
+
+    async fn get_edges_unique_to_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        DeleteDb::get_edges_unique_to_scope(self.inner.as_ref(), dataset_ids, pairs).await
+    }
+
+    async fn get_edge_retrieval_texts_claimed_outside_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+        candidates: &[String],
+    ) -> Result<Vec<String>, DatabaseError> {
+        DeleteDb::get_edge_retrieval_texts_claimed_outside_scope(
+            self.inner.as_ref(),
+            dataset_ids,
+            pairs,
+            candidates,
+        )
+        .await
+    }
+
     async fn delete_provenance_nodes_for_dataset(
         &self,
         dataset_id: Uuid,

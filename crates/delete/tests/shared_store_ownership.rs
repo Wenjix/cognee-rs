@@ -20,7 +20,7 @@ use cognee_database::{
 };
 use cognee_delete::{DeleteMode, DeleteRequest, DeleteScope, DeleteService};
 use cognee_graph::{GraphDBTrait, MockGraphDB};
-use cognee_models::{Data, Dataset, EdgeType};
+use cognee_models::{Data, Dataset, EdgeType, Triplet};
 use cognee_storage::{MockStorage, StorageTrait};
 use cognee_test_utils::PerDatasetMocks;
 use cognee_vector::{MockVectorDB, VectorDB, VectorPoint};
@@ -564,5 +564,206 @@ async fn a_hard_sweep_keeps_degree_one_nodes_still_claimed() {
     assert!(
         !Seed::point(&vector, "Entity", "name", u).await,
         "unclaimed point is swept"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Preview == execution (R-bot feedback)
+// ---------------------------------------------------------------------------
+
+/// (a) Item scope, shared store: X linked to A and B; deleting X from A
+/// previews (and executes) the pair's ledger rows — the artifacts stay
+/// claimed by (B, X), so both preview and result count zero graph/vector
+/// deletions and one provenance row.
+#[tokio::test]
+async fn preview_counts_the_per_pair_cleanup_for_item_deletes() {
+    let seed = seed().await;
+    let a = seed.dataset("a").await;
+    let b = seed.dataset("b").await;
+    let location = seed.storage.store(b"content", "x.txt").await.unwrap();
+    let x = Uuid::new_v4();
+    ops::data::create_data(
+        &seed.db,
+        Data::builder(
+            x,
+            "x.txt",
+            &location,
+            "file://x.txt",
+            "txt",
+            "text/plain",
+            "hash-x".to_string(),
+            seed.owner,
+        )
+        .build(),
+    )
+    .await
+    .unwrap();
+    for ds in [a, b] {
+        ops::datasets::attach_data_to_dataset(&seed.db, ds, x)
+            .await
+            .unwrap();
+    }
+
+    let graph = Arc::new(MockGraphDB::new());
+    let vector = Arc::new(MockVectorDB::new());
+    let s = Uuid::new_v4();
+    graph.add_nodes_raw(vec![node(s, "Entity")]).await.unwrap();
+    point_to(&vector, "Entity", "name", s).await;
+    graph_storage::upsert_nodes(
+        &seed.db,
+        &[
+            seed.node_row(a, x, s, "Entity"),
+            seed.node_row(b, x, s, "Entity"),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let svc = shared_service(&seed, graph, vector);
+    let request = DeleteRequest {
+        scope: DeleteScope::DataInDataset {
+            dataset_id: a,
+            data_id: x,
+            delete_dataset_if_empty: false,
+        },
+        mode: DeleteMode::Soft,
+        memory_only: false,
+    };
+    let preview = svc.preview(&request).await.unwrap();
+    let result = svc.execute(&request).await.unwrap();
+
+    assert_eq!(
+        (
+            preview.graph_nodes_to_delete,
+            preview.vector_points_to_delete,
+            preview.provenance_nodes_to_delete,
+            preview.provenance_edges_to_delete
+        ),
+        (
+            result.deleted_graph_nodes,
+            result.deleted_vector_points,
+            result.deleted_provenance_nodes,
+            result.deleted_provenance_edges
+        ),
+        "preview must count exactly what execute deletes"
+    );
+    assert_eq!(result.deleted_provenance_nodes, 1, "the (A,X) row goes");
+    assert_eq!(result.deleted_graph_nodes, 0, "(B,X) keeps the shared slug");
+}
+
+/// (b) Shared store, EdgeType filtering: A and B each claim an edge with the
+/// same retrieval text — deleting A previews no EdgeType point for it (the
+/// text is claimed outside A), matching execution.
+#[tokio::test]
+async fn preview_filters_edge_type_points_claimed_elsewhere() {
+    let seed = seed().await;
+    let a = seed.dataset("a").await;
+    let b = seed.dataset("b").await;
+    let xa = seed.item(a).await;
+    let xb = seed.item(b).await;
+
+    let graph = Arc::new(MockGraphDB::new());
+    let vector = Arc::new(MockVectorDB::new());
+    let (n1, n2) = (Uuid::new_v4(), Uuid::new_v4());
+    let et = EdgeType::deterministic_id("is_a");
+    point_to(&vector, "EdgeType", "relationship_name", et).await;
+    // A's edge produces a Triplet point — the one point this delete removes.
+    let triplet = Triplet::new(n1, n2, "is_a".to_string(), String::new()).id;
+    point_to(&vector, "Triplet", "text", triplet).await;
+    let ea = Uuid::new_v4();
+    let eb = Uuid::new_v4();
+    graph_storage::upsert_edges(
+        &seed.db,
+        &[
+            seed.edge_row(a, xa, ea, n1, n2, "is_a"),
+            seed.edge_row(b, xb, eb, n1, n2, "is_a"),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let svc = shared_service(&seed, graph, vector);
+    let request = DeleteRequest {
+        scope: DeleteScope::DatasetById { dataset_id: a },
+        mode: DeleteMode::Soft,
+        memory_only: false,
+    };
+    let preview = svc.preview(&request).await.unwrap();
+    let result = svc.execute(&request).await.unwrap();
+
+    assert_eq!(
+        (
+            preview.graph_nodes_to_delete,
+            preview.vector_points_to_delete,
+            preview.provenance_nodes_to_delete,
+            preview.provenance_edges_to_delete
+        ),
+        (
+            result.deleted_graph_nodes,
+            result.deleted_vector_points,
+            result.deleted_provenance_nodes,
+            result.deleted_provenance_edges
+        ),
+        "preview must count exactly what execute deletes"
+    );
+    // A's edge slug is unique to A → its triplet point goes, but the shared
+    // "is_a" EdgeType stays claimed by B — 1 vector point total.
+    assert_eq!(
+        result.deleted_vector_points, 1,
+        "triplet only — EdgeType stays"
+    );
+}
+
+/// (c) Multi-dataset, shared store: A and B both claim slug S — deleting
+/// both in one request deletes S once (by the second cleanup), and preview
+/// counts it once too.
+#[tokio::test]
+async fn preview_counts_a_slug_deleted_once_across_a_multi_dataset_request() {
+    let seed = seed().await;
+    let a = seed.dataset("a").await;
+    let b = seed.dataset("b").await;
+    let xa = seed.item(a).await;
+    let xb = seed.item(b).await;
+
+    let graph = Arc::new(MockGraphDB::new());
+    let vector = Arc::new(MockVectorDB::new());
+    let s = Uuid::new_v4();
+    graph.add_nodes_raw(vec![node(s, "Entity")]).await.unwrap();
+    point_to(&vector, "Entity", "name", s).await;
+    graph_storage::upsert_nodes(
+        &seed.db,
+        &[
+            seed.node_row(a, xa, s, "Entity"),
+            seed.node_row(b, xb, s, "Entity"),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let svc = shared_service(&seed, graph, vector);
+    let preview = svc.preview_datasets_by_id(&[a, b]).await.unwrap();
+    let result = svc
+        .execute_datasets_by_id(&[a, b], DeleteMode::Soft, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            preview.graph_nodes_to_delete,
+            preview.vector_points_to_delete,
+            preview.provenance_nodes_to_delete,
+            preview.provenance_edges_to_delete
+        ),
+        (
+            result.deleted_graph_nodes,
+            result.deleted_vector_points,
+            result.deleted_provenance_nodes,
+            result.deleted_provenance_edges
+        ),
+        "preview must count exactly what execute deletes"
+    );
+    assert_eq!(
+        result.deleted_graph_nodes, 1,
+        "S goes once, not twice or zero"
     );
 }

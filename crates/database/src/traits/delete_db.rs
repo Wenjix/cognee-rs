@@ -196,6 +196,32 @@ pub trait DeleteDb: Send + Sync {
         slugs: &[String],
     ) -> Result<std::collections::HashSet<String>, DatabaseError>;
 
+    /// Node rows inside the delete scope (`datasets` + `(dataset, data)`
+    /// pairs) whose slug no row outside the scope claims — the union rule:
+    /// a slug claimed only by datasets deleted in the same request goes
+    /// exactly once, by the last of them.
+    async fn get_nodes_unique_to_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<Vec<GraphNode>, DatabaseError>;
+
+    /// The edge twin of [`Self::get_nodes_unique_to_scope`].
+    async fn get_edges_unique_to_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<Vec<GraphEdge>, DatabaseError>;
+
+    /// The `candidates` (`EdgeType` retrieval texts) still claimed by edge
+    /// rows outside the delete scope (`datasets` + `(dataset, data)` pairs).
+    async fn get_edge_retrieval_texts_claimed_outside_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+        candidates: &[String],
+    ) -> Result<Vec<String>, DatabaseError>;
+
     /// Delete all provenance node rows for a dataset.
     async fn delete_provenance_nodes_for_dataset(
         &self,
@@ -450,6 +476,37 @@ impl DeleteDb for DatabaseConnection {
         slugs: &[String],
     ) -> Result<std::collections::HashSet<String>, DatabaseError> {
         graph_storage::get_node_slugs_with_claims(self, slugs).await
+    }
+
+    async fn get_nodes_unique_to_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<Vec<GraphNode>, DatabaseError> {
+        graph_storage::get_nodes_unique_to_scope(self, dataset_ids, pairs).await
+    }
+
+    async fn get_edges_unique_to_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+    ) -> Result<Vec<GraphEdge>, DatabaseError> {
+        graph_storage::get_edges_unique_to_scope(self, dataset_ids, pairs).await
+    }
+
+    async fn get_edge_retrieval_texts_claimed_outside_scope(
+        &self,
+        dataset_ids: &[Uuid],
+        pairs: &[(Uuid, Uuid)],
+        candidates: &[String],
+    ) -> Result<Vec<String>, DatabaseError> {
+        graph_storage::get_edge_retrieval_texts_claimed_outside_scope(
+            self,
+            dataset_ids,
+            pairs,
+            candidates,
+        )
+        .await
     }
 
     async fn delete_provenance_nodes_for_dataset(

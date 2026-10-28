@@ -2076,17 +2076,41 @@ impl DeleteService {
 
     /// Count graph nodes, vector points, and provenance rows that would be
     /// affected. Returns `(graph_nodes, vector_points, prov_nodes, prov_edges)`.
+    /// Preview == execution for the artifact counts: the shared store
+    /// deletes an artifact only when no claim survives the *whole* request,
+    /// so it is counted at scope level (`datasets ∪ detached pairs` — a slug
+    /// claimed only by datasets deleted together goes exactly once, by the
+    /// last of them); per-dataset stores drop wholesale. `links_to_detach`
+    /// pairs whose dataset is not deleted each get their own cleanup (M03).
     async fn count_graph_vector_artifacts(
         &self,
         targets: &ResolvedDeleteTargets,
     ) -> Result<(usize, usize, usize, usize), DeleteError> {
-        let mut graph_nodes = 0usize;
-        let mut vector_points = 0usize;
+        let deleted_ids: Vec<Uuid> = targets.datasets_to_delete.iter().map(|d| d.id).collect();
+        let deleted_set: HashSet<Uuid> = deleted_ids.iter().copied().collect();
+        let pair_links: Vec<(Uuid, Uuid)> = targets
+            .links_to_detach
+            .iter()
+            .copied()
+            .filter(|(d, _)| !deleted_set.contains(d))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let scope_pairs: Vec<(Uuid, Uuid)> = targets
+            .links_to_detach
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Provenance: every row of every deleted dataset goes, plus each
+        // surviving-dataset pair's own rows (M03); pairs inside a deleted
+        // dataset are already inside its rows.
         let mut prov_nodes = 0usize;
         let mut prov_edges = 0usize;
-
         for dataset in &targets.datasets_to_delete {
-            let nodes = self
+            prov_nodes += self
                 .database
                 .get_nodes_by_dataset(dataset.id)
                 .await
@@ -2095,9 +2119,9 @@ impl DeleteService {
                         "Failed to count provenance nodes for dataset {}: {e}",
                         dataset.id
                     ))
-                })?;
-
-            let edges = self
+                })?
+                .len();
+            prov_edges += self
                 .database
                 .get_edges_by_dataset(dataset.id)
                 .await
@@ -2106,40 +2130,169 @@ impl DeleteService {
                         "Failed to count provenance edges for dataset {}: {e}",
                         dataset.id
                     ))
+                })?
+                .len();
+        }
+        for (ds, data) in &pair_links {
+            prov_nodes += self
+                .database
+                .get_provenance_node_count_for_data(*data, *ds)
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to count provenance nodes for data {data}: {e}"
+                    ))
                 })?;
+            prov_edges += self
+                .database
+                .get_provenance_edge_count_for_data(*data, *ds)
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to count provenance edges for data {data}: {e}"
+                    ))
+                })?;
+        }
 
-            prov_nodes += nodes.len();
-            prov_edges += edges.len();
-            // The shared store deletes only artifacts no other dataset
-            // claims (M05); the per-dataset branch drops the whole dataset
-            // storage. Preview counts what execution deletes either way.
-            let (gn, vp) = if self.dataset_storage.is_some() {
-                ledger_artifact_counts(&nodes, &edges)
-            } else {
-                let unique_nodes = self
+        let mut graph_nodes = 0usize;
+        let mut vector_points = 0usize;
+        if self.dataset_storage.is_some() {
+            // Per-dataset stores drop wholesale with their dataset; detached
+            // pairs in surviving datasets clean their exclusive artifacts.
+            for dataset in &targets.datasets_to_delete {
+                let nodes = self
                     .database
-                    .get_nodes_unique_to_dataset(dataset.id)
+                    .get_nodes_by_dataset(dataset.id)
                     .await
                     .map_err(|e| {
                         DeleteError::Runtime(format!(
-                            "Failed to count unique provenance nodes for dataset {}: {e}",
+                            "Failed to count provenance nodes for dataset {}: {e}",
                             dataset.id
                         ))
                     })?;
-                let unique_edges = self
+                let edges = self
                     .database
-                    .get_edges_unique_to_dataset(dataset.id)
+                    .get_edges_by_dataset(dataset.id)
                     .await
                     .map_err(|e| {
                         DeleteError::Runtime(format!(
-                            "Failed to count unique provenance edges for dataset {}: {e}",
+                            "Failed to count provenance edges for dataset {}: {e}",
                             dataset.id
                         ))
                     })?;
-                ledger_artifact_counts(&unique_nodes, &unique_edges)
-            };
-            graph_nodes += gn;
-            vector_points += vp;
+                let (gn, vp) = ledger_artifact_counts(&nodes, &edges);
+                graph_nodes += gn;
+                vector_points += vp;
+            }
+            for (ds, data) in &pair_links {
+                let nodes = self
+                    .database
+                    .get_unique_nodes_for_data(*data, *ds)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to count unique nodes for data {data}: {e}"
+                        ))
+                    })?;
+                let edges = self
+                    .database
+                    .get_unique_edges_for_data(*data, *ds)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to count unique edges for data {data}: {e}"
+                        ))
+                    })?;
+                let structural = self
+                    .database
+                    .get_structural_edges_for_data(*data, *ds)
+                    .await
+                    .map_err(|e| {
+                        DeleteError::Runtime(format!(
+                            "Failed to count structural edges for data {data}: {e}"
+                        ))
+                    })?;
+                let et_ids = self
+                    .edge_type_ids_to_delete(*data, *ds, &edges, &structural)
+                    .await?;
+                let slugs: HashSet<Uuid> = nodes.iter().map(|n| n.slug).collect();
+                let node_points: HashSet<(Uuid, String, String)> = nodes
+                    .iter()
+                    .flat_map(|n| {
+                        parse_indexed_fields(&n.indexed_fields)
+                            .into_iter()
+                            .map(|f| (n.slug, n.node_type.clone(), f))
+                    })
+                    .collect();
+                let triplet_points: HashSet<Uuid> = edges
+                    .iter()
+                    .chain(structural.iter())
+                    .map(triplet_vector_id)
+                    .collect();
+                graph_nodes += slugs.len();
+                vector_points += node_points.len() + triplet_points.len() + et_ids.len();
+            }
+        } else {
+            // Shared store: one scope-level pass. A slug whose claims all sit
+            // inside the scope goes exactly once — `get_*_unique_to_scope`
+            // models "no surviving claim" across every sequential cleanup in
+            // the request.
+            let nodes = self
+                .database
+                .get_nodes_unique_to_scope(&deleted_ids, &scope_pairs)
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to count scope-unique provenance nodes: {e}"
+                    ))
+                })?;
+            let edges = self
+                .database
+                .get_edges_unique_to_scope(&deleted_ids, &scope_pairs)
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to count scope-unique provenance edges: {e}"
+                    ))
+                })?;
+            let candidates: Vec<String> = edges
+                .iter()
+                .map(edge_retrieval_text)
+                .filter(|t| !t.is_empty())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let claimed: HashSet<String> = self
+                .database
+                .get_edge_retrieval_texts_claimed_outside_scope(
+                    &deleted_ids,
+                    &scope_pairs,
+                    &candidates,
+                )
+                .await
+                .map_err(|e| {
+                    DeleteError::Runtime(format!(
+                        "Failed to count surviving edge texts outside the scope: {e}"
+                    ))
+                })?
+                .into_iter()
+                .collect();
+            let slugs: HashSet<Uuid> = nodes.iter().map(|n| n.slug).collect();
+            // Points are content-keyed, not row-keyed: several scope rows
+            // can name one artifact (slug / triplet / EdgeType id), and the
+            // sequential cleanups delete it once. Count each distinct point.
+            let node_points: HashSet<(Uuid, String, String)> = nodes
+                .iter()
+                .flat_map(|n| {
+                    parse_indexed_fields(&n.indexed_fields)
+                        .into_iter()
+                        .map(|f| (n.slug, n.node_type.clone(), f))
+                })
+                .collect();
+            let triplet_points: HashSet<Uuid> = edges.iter().map(triplet_vector_id).collect();
+            let edge_type_points = candidates.iter().filter(|t| !claimed.contains(*t)).count();
+            graph_nodes += slugs.len();
+            vector_points += node_points.len() + triplet_points.len() + edge_type_points;
         }
 
         Ok((graph_nodes, vector_points, prov_nodes, prov_edges))

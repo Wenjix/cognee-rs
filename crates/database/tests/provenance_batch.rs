@@ -88,7 +88,6 @@ async fn upserts_large_graph_without_variable_overflow() {
 /// drops it afterwards, so they need no `#[serial]` guard (which would be a
 /// no-op under the project's per-process `cargo nextest` runner anyway) and can
 /// never clobber a developer's existing data.
-#[cfg(feature = "postgres")]
 /// `get_node_slugs_with_claims` returns exactly the slugs that have a
 /// provenance node row — an unclaimed UUID and a non-UUID string are absent.
 #[tokio::test]
@@ -142,6 +141,7 @@ async fn node_slugs_with_claims_returns_only_claimed_slugs() {
     );
 }
 
+#[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
     use cognee_database::ops::graph_storage::{get_edges_by_data, get_nodes_by_data};
