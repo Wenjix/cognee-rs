@@ -42,7 +42,7 @@
 //! ([`load`]) is how a candidate summarizer gets evaluated before it is wired
 //! in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -81,6 +81,11 @@ const CACHE_CAPACITY: usize = 512;
 /// request, user or dataset: a summary is a pure function of its passage, so a
 /// lookup by text can only ever return a summary of text the caller already
 /// retrieved — no cross-tenant read is possible, whatever the id scheme.
+///
+/// That invariant is why only single-passage results are cached: a batched
+/// summary — split per line, or attributed whole to the first passage — can
+/// carry facts from *other* passages of its batch, which a lookup keyed by
+/// one passage's text would hand to a caller who never retrieved them.
 fn cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -109,7 +114,9 @@ pub(crate) fn known(chunks: &[SearchItem], summary_file: Option<&Path>) -> HashM
     summaries
 }
 
-/// Summarize `passages` with `llm`, caching each result.
+/// Summarize `passages` with `llm`, caching each result produced by a
+/// single-passage call (batched summaries are request-scoped — see
+/// [`cache`]).
 ///
 /// `batch` passages go into one call. The token count is the same either way —
 /// the same text is prefilled and a similar number of tokens is generated —
@@ -123,6 +130,9 @@ pub(crate) async fn summarize(
 ) -> HashMap<String, String> {
     let batch = batch.max(1);
     let mut produced: HashMap<String, String> = HashMap::new();
+    // Ids a call of their own summarized: only those are pure functions of
+    // one passage and may join the process-wide cache (M26).
+    let mut cacheable: HashSet<String> = HashSet::new();
 
     for group in passages.chunks(batch) {
         let user_prompt = if group.len() == 1 {
@@ -167,6 +177,7 @@ pub(crate) async fn summarize(
         if group.len() == 1 {
             if let Some((id, _)) = group.first() {
                 produced.insert(id.clone(), content.to_string());
+                cacheable.insert(id.clone());
             }
             continue;
         }
@@ -202,6 +213,12 @@ pub(crate) async fn summarize(
 
     let mut cache = cache().lock().unwrap_or_else(PoisonError::into_inner);
     for (id, text) in passages {
+        // Batched output stays request-scoped: the caller retrieved every
+        // passage of its batch already, but another caller keying on this
+        // one passage's text must not inherit facts from its neighbours.
+        if !cacheable.contains(id) {
+            continue;
+        }
         let Some(summary) = produced.get(id) else {
             continue;
         };
@@ -274,5 +291,77 @@ mod tests {
             strip_list_marker("Mr. Rabbit is late."),
             "Mr. Rabbit is late."
         );
+    }
+
+    /// A chunk fixture carrying one passage `text` — what `known()` keys on.
+    fn chunk_named(id: &str, text: &str) -> SearchItem {
+        SearchItem {
+            id: None,
+            score: None,
+            payload: serde_json::json!({"id": id, "text": text}),
+        }
+    }
+
+    fn passages(n: usize, tag: &str) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    format!("{tag} passage {i} {}", uuid::Uuid::new_v4()),
+                )
+            })
+            .collect()
+    }
+
+    /// M26: a batched response that does not split one line per passage is
+    /// attributed to the first passage *for this request* — but must not be
+    /// cached under that passage's text, where another dataset's identical
+    /// passage would inherit facts from its neighbours.
+    #[tokio::test]
+    async fn a_noncompliant_batch_is_returned_but_not_cached() {
+        let items = passages(3, "noncompliant");
+        let blob = "everything in one blob".to_string();
+        let llm = cognee_test_utils::MockLlm::new(vec![blob.clone()]);
+        let out = summarize(&llm, &items, 3).await;
+        assert_eq!(out.get("p0"), Some(&blob));
+        assert!(!out.contains_key("p1") && !out.contains_key("p2"));
+
+        // And the process-wide cache holds nothing for any of the passages.
+        let chunks: Vec<SearchItem> = items
+            .iter()
+            .map(|(id, text)| chunk_named(id, text))
+            .collect();
+        assert!(known(&chunks, None).is_empty());
+    }
+
+    /// M26: even a compliant one-line-per-passage split stays request-scoped
+    /// — each line still shares the context of its batchmates.
+    #[tokio::test]
+    async fn a_compliant_batch_is_returned_but_not_cached() {
+        let items = passages(3, "compliant");
+        let llm = cognee_test_utils::MockLlm::new(vec![
+            "1. sum one\n2. sum two\n3. sum three".to_string(),
+        ]);
+        let out = summarize(&llm, &items, 3).await;
+        assert_eq!(out.len(), 3, "{out:?}");
+
+        let chunks: Vec<SearchItem> = items
+            .iter()
+            .map(|(id, text)| chunk_named(id, text))
+            .collect();
+        assert!(known(&chunks, None).is_empty());
+    }
+
+    /// Single-passage calls are pure functions of their passage — those
+    /// still populate the cache and `known()` serves them back.
+    #[tokio::test]
+    async fn a_single_passage_result_is_cached() {
+        let items = passages(1, "single");
+        let llm = cognee_test_utils::MockLlm::new(vec!["just the one".to_string()]);
+        let out = summarize(&llm, &items, 1).await;
+        assert_eq!(out.get("p0"), Some(&"just the one".to_string()));
+
+        let known = known(&[chunk_named("p0", &items[0].1)], None);
+        assert_eq!(known.get("p0"), Some(&"just the one".to_string()));
     }
 }

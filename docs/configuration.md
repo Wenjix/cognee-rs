@@ -1683,6 +1683,13 @@ What an attached `AclDb` changes for search and recall:
   dataset the caller may read, and returns an empty result when there is none
   (Python's ACL mode). Every such search needs the caller's user id; recall
   with an unknown caller gets no graph results.
+- An `AclDb` attached while storage stays shared (the default) is refused
+  outright — `InvalidInput` after the permission check, before any store is
+  read. The unscoped shared-store answer cannot be limited to the datasets
+  the caller may read, and Python refuses the same combination at startup.
+  Turn on `ENABLE_BACKEND_ACCESS_CONTROL` to use access control.
+  Retrievers whose results are not dataset data (feedback analysis) still
+  run.
 
 How a search is scoped depends on storage, not on the ACL:
 
@@ -1696,7 +1703,8 @@ How a search is scoped depends on storage, not on the ACL:
   an ACL, "every dataset the caller may read" is the caller's own datasets in
   its tenant.
 - **Shared store** (the default): one unscoped search, whatever datasets the
-  request names, after the permission check — Python's non-ACL mode. Nothing
+  request names — Python's non-ACL mode, available only without an `AclDb`;
+  an attached ACL over the shared store is refused (`InvalidInput`). Nothing
   is filtered by dataset membership any more; the former post-filter could not
   be made tight, and the six types it refused (`TEMPORAL`, `CYPHER`,
   `NATURAL_LANGUAGE`, `CHUNKS_LEXICAL`, `FEELING_LUCKY`, `CODING_RULES`) run
