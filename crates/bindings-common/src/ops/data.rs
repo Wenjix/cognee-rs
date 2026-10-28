@@ -125,26 +125,31 @@ pub fn marshal_dataset_ref(value: Option<&serde_json::Value>) -> Result<DatasetR
 /// `target_json` is a discriminated union on `"kind"` (camelCase keys).
 /// `opts` may be `serde_json::Value::Null` when no options were provided.
 ///
+/// Optional `opts` fields (camelCase):
+/// - `"tenant"`: tenant UUID string — the tenant the target resolves in
+///
 /// Returns `{"target":"…","deleteResult":{…}}`.
 pub async fn forget(
     state: &HandleState,
     target_json: serde_json::Value,
-    _opts: &serde_json::Value,
+    opts: &serde_json::Value,
 ) -> Result<serde_json::Value, SdkError> {
-    // _opts is reserved for future tenant support — same decision as capi/neon.
     let svc = state.services().await?;
     let owner_id = state.owner_id().await?;
+    // Java's `Cognee.forget(ForgetTarget, String tenant)` sends
+    // `{"tenant": …}`: honour it rather than silently resolving in the
+    // handle's tenant. Without opts, dataset references resolve among the
+    // handle's tenant's datasets (strict, Python D4).
+    let tenant_id = opts_tenant(opts)?.or(state.tenant_id());
 
     let target = marshal_forget_target(&target_json)?;
 
     let db_ref: &dyn IngestDb = svc.database.as_ref();
 
-    // The handle user is tenant-less (`None`): dataset references resolve
-    // among tenant-less datasets only (strict, Python D4).
     let result = cognee_forget(
         target,
         owner_id,
-        state.tenant_id(),
+        tenant_id,
         svc.delete_service.as_ref(),
         Some(db_ref),
     )

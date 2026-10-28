@@ -94,12 +94,15 @@ pub struct UpdateResult {
 /// lacks `write` on the dataset **in `tenant_id`** — no grant and a grant only
 /// on another tenant's dataset answer the same, like Python's single
 /// `PermissionDeniedError` (403,
-/// `cognee/modules/users/exceptions/exceptions.py:42-51@37f788bd2`). A failing
-/// ACL backend is `ApiError::InvalidArgument`. A `node_set` (the call's, or
-/// one in an item's `external_metadata`) that is not a list of non-empty
-/// names is `ApiError::Ingestion` (Python's `InvalidNodeSetError`). A
-/// dataset that does not exist, or does not hold `data_id`, is the delete
-/// service's error. All of these, and every add failure, are raised **before**
+/// `cognee/modules/users/exceptions/exceptions.py:42-51@37f788bd2`). With no
+/// ACL the same answer applies the ownership rule [`DatasetManager`] uses:
+/// `db` is required (else `ApiError::InvalidArgument`), and a dataset that is
+/// missing or whose `owner_id`/`tenant_id` differ — strictly, `None` matches
+/// only `None` — is denied, so unknown and foreign ids are indistinguishable.
+/// A failing ACL backend is `ApiError::InvalidArgument`. A `node_set` (the
+/// call's, or one in an item's `external_metadata`) that is not a list of
+/// non-empty names is `ApiError::Ingestion` (Python's `InvalidNodeSetError`).
+/// A dataset that does not hold `data_id` is the delete service's error. All of these, and every add failure, are raised **before**
 /// the old data is touched. Propagates errors from the remove and cognify
 /// phases.
 #[allow(clippy::too_many_arguments)]
@@ -128,6 +131,28 @@ pub async fn update(
     // ── Permission gate ───────────────────────────────────────────────────────
     if let Some(acl) = acl_db {
         require_write_permission(acl, owner_id, tenant_id, dataset_id).await?;
+    } else {
+        // Without an ACL nothing would authorize `dataset_id` — the delete
+        // service deliberately does not check `DataInDataset`, so a caller
+        // could otherwise attach replacement data to and detach items from
+        // another owner or tenant's dataset (M34). Apply the ownership rule
+        // DatasetManager uses without an ACL; an unknown id and a foreign
+        // one answer identically so neither leaks which exists.
+        let db_ref = db.as_deref().ok_or_else(|| {
+            ApiError::InvalidArgument(
+                "update requires a relational database to authorize the dataset".to_string(),
+            )
+        })?;
+        let owned = db_ref
+            .get_dataset(dataset_id)
+            .await
+            .map_err(|e| ApiError::InvalidArgument(e.to_string()))?
+            .is_some_and(|d| d.owner_id == owner_id && d.tenant_id == tenant_id);
+        if !owned {
+            return Err(ApiError::PermissionDenied(
+                "write permission denied on dataset".to_string(),
+            ));
+        }
     }
 
     // ── Refuse what the add would refuse, before anything is stored ─────────
@@ -881,5 +906,147 @@ mod tests {
             "the memory-only delete cleared the completion marker, so the item is \
              re-cognified under its new node set rather than skipped"
         );
+    }
+
+    /// M34: without an ACL nothing authorized `dataset_id`, so a handle
+    /// could replace data in a dataset owned by someone else. The no-ACL
+    /// gate now applies DatasetManager's ownership rule.
+    #[tokio::test]
+    async fn a_foreign_owner_is_denied_and_nothing_changes() {
+        let fx = Fixture::new().await;
+        let old = fx.add("the old content").await;
+
+        let err = update(
+            old.id,
+            vec![DataInput::Text("the new content".into())],
+            fx.dataset_id,
+            "x",
+            Uuid::new_v4(), // a different owner
+            None,
+            None,
+            None,
+            true,
+            None,
+            &fx.delete_service,
+            &fx.add_pipeline,
+            Arc::clone(&fx.llm),
+            Arc::clone(&fx.storage),
+            Arc::clone(&fx.graph_db),
+            Arc::clone(&fx.vector_db),
+            Arc::clone(&fx.embedding),
+            Some(fx.db.clone() as Arc<dyn RelationalDb>),
+            Arc::clone(&fx.ontology),
+            &fx.cognify_config,
+        )
+        .await
+        .expect_err("a dataset owned by someone else is denied");
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "got {err:?}");
+        // The old item is still attached and nothing new was stored.
+        assert!(fx.row(old.id).await.is_some(), "the old row survives");
+        assert_eq!(fx.linked().await, vec![old.id]);
+    }
+
+    /// Same owner but a tenant the dataset is not in: the strict
+    /// `None ⇔ None` tenant comparison denies it (M34).
+    #[tokio::test]
+    async fn the_owner_in_another_tenant_is_denied() {
+        let fx = Fixture::new().await;
+        let old = fx.add("the old content").await;
+
+        let err = update(
+            old.id,
+            vec![DataInput::Text("the new content".into())],
+            fx.dataset_id,
+            "x",
+            fx.owner,
+            Some(Uuid::new_v4()), // dataset is tenant-less
+            None,
+            None,
+            true,
+            None,
+            &fx.delete_service,
+            &fx.add_pipeline,
+            Arc::clone(&fx.llm),
+            Arc::clone(&fx.storage),
+            Arc::clone(&fx.graph_db),
+            Arc::clone(&fx.vector_db),
+            Arc::clone(&fx.embedding),
+            Some(fx.db.clone() as Arc<dyn RelationalDb>),
+            Arc::clone(&fx.ontology),
+            &fx.cognify_config,
+        )
+        .await
+        .expect_err("same owner, wrong tenant is denied");
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "got {err:?}");
+        assert_eq!(fx.linked().await, vec![old.id]);
+    }
+
+    /// An unknown dataset id answers the same `PermissionDenied` as a
+    /// foreign one — the caller cannot tell which exists (M34). Before the
+    /// gate this fell through to the delete service's not-found error.
+    #[tokio::test]
+    async fn an_unknown_dataset_is_denied_not_not_found() {
+        let fx = Fixture::new().await;
+
+        let err = update(
+            Uuid::new_v4(),
+            vec![DataInput::Text("the new content".into())],
+            Uuid::new_v4(), // no such dataset
+            "x",
+            fx.owner,
+            None,
+            None,
+            None,
+            true,
+            None,
+            &fx.delete_service,
+            &fx.add_pipeline,
+            Arc::clone(&fx.llm),
+            Arc::clone(&fx.storage),
+            Arc::clone(&fx.graph_db),
+            Arc::clone(&fx.vector_db),
+            Arc::clone(&fx.embedding),
+            Some(fx.db.clone() as Arc<dyn RelationalDb>),
+            Arc::clone(&fx.ontology),
+            &fx.cognify_config,
+        )
+        .await
+        .expect_err("an unknown dataset is denied like a foreign one");
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    /// The gate needs the database to authorize against: `db: None`
+    /// without an ACL is `InvalidArgument`, not an open door (M34).
+    #[tokio::test]
+    async fn no_acl_and_no_database_is_invalid_argument() {
+        let fx = Fixture::new().await;
+        let old = fx.add("the old content").await;
+
+        let err = update(
+            old.id,
+            vec![DataInput::Text("the new content".into())],
+            fx.dataset_id,
+            "x",
+            fx.owner,
+            None,
+            None,
+            None,
+            true,
+            None,
+            &fx.delete_service,
+            &fx.add_pipeline,
+            Arc::clone(&fx.llm),
+            Arc::clone(&fx.storage),
+            Arc::clone(&fx.graph_db),
+            Arc::clone(&fx.vector_db),
+            Arc::clone(&fx.embedding),
+            None,
+            Arc::clone(&fx.ontology),
+            &fx.cognify_config,
+        )
+        .await
+        .expect_err("no ACL and no database cannot authorize the update");
+        assert!(matches!(err, ApiError::InvalidArgument(_)), "got {err:?}");
+        assert_eq!(fx.linked().await, vec![old.id]);
     }
 }
