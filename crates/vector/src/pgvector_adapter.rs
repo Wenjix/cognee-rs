@@ -4498,7 +4498,7 @@ impl VectorDB for PgVectorAdapter {
 
         let query = Query::select()
             .expr_as(Func::count(Expr::col(Asterisk)), Alias::new("count"))
-            .from(Alias::new(&coll))
+            .from(self.table_ref(&coll))
             .to_owned();
 
         let row = self
@@ -4988,6 +4988,17 @@ mod shared_db_migration_tests {
                     .search_similar("Sent", "f", &[1.0; 8], 10)
                     .await
                     .expect_err("a dropped schema must error, not read public");
+                assert!(
+                    err.to_string().contains("does not exist"),
+                    "expected a missing-relation error, got {err}"
+                );
+
+                // `collection_size` must fail too — an unqualified COUNT
+                // would have silently answered with public's sentinel (1).
+                let err = adapter
+                    .collection_size("Sent", "f")
+                    .await
+                    .expect_err("count on a dropped schema must error, not read public");
                 assert!(
                     err.to_string().contains("does not exist"),
                     "expected a missing-relation error, got {err}"
