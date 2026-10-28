@@ -4,12 +4,19 @@
 //! The file path mirrors the Python key format:
 //! `{base_dir}/{user_id}/{session_id}.json`
 //!
+//! `user_id` and `session_id` are caller-supplied: any identifier that could
+//! leave the directory it is joined to (empty, `.`, `..`, a leading `%`, or
+//! containing `/` or NUL — plus the Windows-forbidden characters) is stored
+//! as `%` + its percent-encoding instead, see [`path_component`]. Safe ids
+//! map to themselves, so files written before this encoding keep their names.
+//!
 //! Python uses `diskcache` which stores values in a SQLite database under
 //! `.cognee_fs_cache/sessions_db/`. Our implementation uses plain JSON files
 //! for simplicity while keeping the same logical key structure
 //! (`agent_sessions:{user_id}:{session_id}`) and identical JSON entry format
 //! so data written by one SDK can be read by the other at the API level.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -99,9 +106,51 @@ impl FsSessionStore {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// `id` as a single file-name component that cannot leave the directory it is
+/// joined to. A safe identifier maps to itself, so session files written before
+/// this encoding keep their names. Any other identifier is written as `%`
+/// followed by its percent-encoding (`%` and every unsafe character escaped as
+/// `%XX` per UTF-8 byte); a raw name never starts with `%`, so the mapping is
+/// injective.
+fn path_component(id: &str) -> Cow<'_, str> {
+    fn is_unsafe_char(c: char) -> bool {
+        if c == '/' || c == '\0' {
+            return true;
+        }
+        if cfg!(windows)
+            && (matches!(c, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') || c.is_ascii_control())
+        {
+            return true;
+        }
+        false
+    }
+    let unsafe_id = id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.starts_with('%')
+        || id.chars().any(is_unsafe_char);
+    if !unsafe_id {
+        return Cow::Borrowed(id);
+    }
+    let mut out = String::with_capacity(id.len() + 1);
+    out.push('%');
+    for c in id.chars() {
+        if c == '%' || is_unsafe_char(c) {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 fn session_file(base: &Path, user_id: Option<&str>, session_id: &str) -> PathBuf {
     let uid = user_id.unwrap_or("default");
-    base.join(uid).join(format!("{session_id}.json"))
+    base.join(path_component(uid).as_ref())
+        .join(format!("{}.json", path_component(session_id)))
 }
 
 async fn load_entries(path: &Path) -> Result<Vec<FsQAEntry>, SessionError> {
@@ -175,12 +224,15 @@ fn fs_entry_to_domain(e: &FsQAEntry, session_id: &str) -> SessionQAEntry {
 
 fn graph_context_file(base: &Path, user_id: Option<&str>, session_id: &str) -> PathBuf {
     let uid = user_id.unwrap_or("default");
-    base.join(uid)
-        .join(format!("_graph_context_{session_id}.json"))
+    base.join(path_component(uid).as_ref()).join(format!(
+        "_graph_context_{}.json",
+        path_component(session_id)
+    ))
 }
 
 fn trace_session_file(base: &Path, user_id: &str, session_id: &str) -> PathBuf {
-    base.join(user_id).join(format!("{session_id}.traces.json"))
+    base.join(path_component(user_id).as_ref())
+        .join(format!("{}.traces.json", path_component(session_id)))
 }
 
 async fn load_trace_steps(path: &Path) -> Result<Vec<SessionTraceStep>, SessionError> {
@@ -776,5 +828,177 @@ mod tests {
             .await
             .expect("get should succeed");
         assert!(ctx.is_none());
+    }
+
+    // ── path_component traversal containment (M27–M31) ──────────────────────
+
+    /// `path` must be `base/<one normal dir>/<one normal file name>` — nothing
+    /// may escape `base` or add intermediate components.
+    fn assert_two_normal_components(base: &Path, path: &Path) {
+        let rel = path.strip_prefix(base).expect("path must stay under base");
+        let comps: Vec<_> = rel.components().collect();
+        assert_eq!(comps.len(), 2, "{rel:?}");
+        for c in &comps {
+            assert!(matches!(c, std::path::Component::Normal(_)), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn unsafe_session_and_user_ids_cannot_leave_the_base_dir() {
+        let base = Path::new("/base");
+        for sid in [
+            "../escape",
+            "../../etc/x",
+            "/abs/path",
+            "a/b",
+            "..",
+            ".",
+            "",
+        ] {
+            assert_two_normal_components(base, &session_file(base, Some("u1"), sid));
+            assert_two_normal_components(base, &graph_context_file(base, Some("u1"), sid));
+            assert_two_normal_components(base, &trace_session_file(base, "u1", sid));
+        }
+        for uid in ["..", "../other", "/abs", "", "a/b"] {
+            assert_two_normal_components(base, &session_file(base, Some(uid), "s1"));
+            assert_two_normal_components(base, &graph_context_file(base, Some(uid), "s1"));
+            assert_two_normal_components(base, &trace_session_file(base, uid, "s1"));
+        }
+    }
+
+    #[test]
+    fn safe_ids_keep_their_legacy_file_names() {
+        let base = Path::new("/base");
+        let uuid = Uuid::new_v4().to_string();
+        for sid in ["s1", uuid.as_str(), "user%40x"] {
+            assert_eq!(
+                session_file(base, Some("u"), sid),
+                base.join("u").join(format!("{sid}.json"))
+            );
+            assert_eq!(
+                graph_context_file(base, Some("u"), sid),
+                base.join("u").join(format!("_graph_context_{sid}.json"))
+            );
+            assert_eq!(
+                trace_session_file(base, "u", sid),
+                base.join("u").join(format!("{sid}.traces.json"))
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            session_file(base, Some("u"), "chat:42"),
+            base.join("u").join("chat:42.json")
+        );
+    }
+
+    /// Test-only inverse of [`path_component`]: a raw name decodes to
+    /// itself; an encoded name loses its leading `%` and each `%XX` escape
+    /// decodes back to a UTF-8 byte sequence.
+    fn decode(name: &str) -> String {
+        let Some(rest) = name.strip_prefix('%') else {
+            return name.to_string();
+        };
+        let bytes = rest.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 3 <= bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn path_component_encoding_has_a_left_inverse() {
+        // A left inverse proves the encoding is injective: distinct inputs
+        // can never share one file name.
+        for id in [
+            "",
+            ".",
+            "..",
+            "%",
+            "%25",
+            "/2F",
+            "//",
+            "a/b",
+            "%a%2Fb",
+            "%a/b",
+            "a%2Fb",
+            "日本/語",
+            "x\0y",
+            "user%40x",
+        ] {
+            assert_eq!(decode(&path_component(id)), id, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn encoded_names_are_injective() {
+        let names: std::collections::HashSet<_> =
+            ["a/b", "%a%2Fb", "%a/b", "..", ".", "", "%x", "/2F", "//"]
+                .iter()
+                .map(|s| session_file(Path::new("/b"), Some("u"), s))
+                .collect();
+        assert_eq!(names.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn traversal_ids_never_read_or_write_outside_the_owner_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let victim = base.join("victim.json");
+        std::fs::write(&victim, b"precious").unwrap();
+        let store = FsSessionStore::new(base);
+        store
+            .create_qa_entry("../victim", Some("u1"), "q", "a", None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let entries = store
+            .get_all_qa_entries("../victim", Some("u1"))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].question, "q");
+        // Graph context and traces with traversal ids stay under base/u1/ too.
+        store
+            .set_graph_context("../ctx", Some("u1"), "{}")
+            .await
+            .unwrap();
+        store
+            .save_trace_step(
+                "u1",
+                "../tr",
+                SessionTraceStep {
+                    trace_id: "t1".to_string(),
+                    origin_function: "f".to_string(),
+                    status: "success".to_string(),
+                    memory_query: String::new(),
+                    memory_context: String::new(),
+                    method_params: serde_json::json!({}),
+                    method_return_value: None,
+                    error_message: String::new(),
+                    session_feedback: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut escaped = Vec::new();
+        for entry in std::fs::read_dir(base).unwrap() {
+            let e = entry.unwrap();
+            if e.file_name() != "u1" && e.file_name() != "victim.json" {
+                escaped.push(e.path());
+            }
+        }
+        assert!(
+            escaped.is_empty(),
+            "files escaped the owner dir: {escaped:?}"
+        );
     }
 }

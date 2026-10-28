@@ -128,9 +128,23 @@ fn connection_info(host: &str, port: u16, username: &str, password: &str) -> red
     }
 }
 
-fn session_key(user_id: Option<&str>, session_id: &str) -> String {
+/// The user id is the middle segment of every session key, so a `:` in one
+/// would make keys ambiguous (`a:b` + `c` == `a` + `b:c`). Session ids may
+/// contain `:` — they are always the last segment, so they stay unambiguous
+/// once the user id is colon-free.
+fn validate_user_id(user_id: &str) -> Result<(), SessionError> {
+    if user_id.contains(':') {
+        return Err(SessionError::InvalidParameter(format!(
+            "user_id may not contain ':': {user_id:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn session_key(user_id: Option<&str>, session_id: &str) -> Result<String, SessionError> {
     let uid = user_id.unwrap_or("default");
-    format!("agent_sessions:{uid}:{session_id}")
+    validate_user_id(uid)?;
+    Ok(format!("agent_sessions:{uid}:{session_id}"))
 }
 
 fn build_entry(qa_id: &str, question: &str, answer: &str, context: Option<&str>) -> RedisQAEntry {
@@ -178,13 +192,15 @@ fn redis_entry_to_domain(e: &RedisQAEntry, session_id: &str) -> SessionQAEntry {
     }
 }
 
-fn graph_context_key(user_id: Option<&str>, session_id: &str) -> String {
+fn graph_context_key(user_id: Option<&str>, session_id: &str) -> Result<String, SessionError> {
     let uid = user_id.unwrap_or("default");
-    format!("graph_knowledge:{uid}:{session_id}")
+    validate_user_id(uid)?;
+    Ok(format!("graph_knowledge:{uid}:{session_id}"))
 }
 
-fn trace_key(user_id: &str, session_id: &str) -> String {
-    format!("cognee:trace:{user_id}:{session_id}")
+fn trace_key(user_id: &str, session_id: &str) -> Result<String, SessionError> {
+    validate_user_id(user_id)?;
+    Ok(format!("cognee:trace:{user_id}:{session_id}"))
 }
 
 /// Apply a `SessionQAUpdate` to a `RedisQAEntry` in place.
@@ -239,7 +255,7 @@ impl SessionStore for RedisSessionStore {
         let json = serde_json::to_string(&entry)
             .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
 
-        let key = session_key(user_id, session_id);
+        let key = session_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         conn.rpush::<_, _, ()>(&key, &json).await.map_err(map_err)?;
         self.apply_session_ttl(&mut conn, &key).await?;
@@ -253,7 +269,7 @@ impl SessionStore for RedisSessionStore {
         user_id: Option<&str>,
         last_n: usize,
     ) -> Result<Vec<SessionQAEntry>, SessionError> {
-        let key = session_key(user_id, session_id);
+        let key = session_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         let raw: Vec<String> = conn
             .lrange(&key, -(last_n as isize), -1)
@@ -274,7 +290,7 @@ impl SessionStore for RedisSessionStore {
         session_id: &str,
         user_id: Option<&str>,
     ) -> Result<Vec<SessionQAEntry>, SessionError> {
-        let key = session_key(user_id, session_id);
+        let key = session_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         let raw: Vec<String> = conn.lrange(&key, 0, -1).await.map_err(map_err)?;
 
@@ -292,7 +308,7 @@ impl SessionStore for RedisSessionStore {
         session_id: &str,
         user_id: Option<&str>,
     ) -> Result<bool, SessionError> {
-        let key = session_key(user_id, session_id);
+        let key = session_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         let deleted: i64 = conn.del(&key).await.map_err(map_err)?;
         Ok(deleted > 0)
@@ -304,7 +320,7 @@ impl SessionStore for RedisSessionStore {
         user_id: Option<&str>,
         qa_id: &str,
     ) -> Result<bool, SessionError> {
-        let key = session_key(user_id, session_id);
+        let key = session_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
 
         // Load all entries, remove the target, rewrite — same approach as Python.
@@ -377,7 +393,7 @@ impl SessionStore for RedisSessionStore {
         qa_id: &str,
         updates: SessionQAUpdate,
     ) -> Result<bool, SessionError> {
-        let key = session_key(user_id, session_id);
+        let key = session_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
 
         // Load all entries, find and update the target, rewrite the list.
@@ -421,7 +437,7 @@ impl SessionStore for RedisSessionStore {
         session_id: &str,
         user_id: Option<&str>,
     ) -> Result<Option<String>, SessionError> {
-        let key = graph_context_key(user_id, session_id);
+        let key = graph_context_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         let result: Option<String> = conn.get(&key).await.map_err(map_err)?;
         Ok(result)
@@ -433,7 +449,7 @@ impl SessionStore for RedisSessionStore {
         user_id: Option<&str>,
         context: &str,
     ) -> Result<(), SessionError> {
-        let key = graph_context_key(user_id, session_id);
+        let key = graph_context_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         conn.set::<_, _, ()>(&key, context).await.map_err(map_err)?;
         self.apply_session_ttl(&mut conn, &key).await?;
@@ -451,7 +467,7 @@ impl SessionStore for RedisSessionStore {
             .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
 
         // Python uses RPUSH (NOT LPUSH) so LRANGE 0 -1 returns oldest-first.
-        let key = trace_key(user_id, session_id);
+        let key = trace_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         conn.rpush::<_, _, ()>(&key, &json).await.map_err(map_err)?;
         self.apply_session_ttl(&mut conn, &key).await?;
@@ -464,7 +480,7 @@ impl SessionStore for RedisSessionStore {
         user_id: &str,
         session_id: &str,
     ) -> Result<Vec<SessionTraceStep>, SessionError> {
-        let key = trace_key(user_id, session_id);
+        let key = trace_key(user_id, session_id)?;
         let mut conn = self.conn.clone();
         let raw: Vec<String> = conn.lrange(&key, 0, -1).await.map_err(map_err)?;
 
@@ -484,7 +500,8 @@ impl SessionStore for RedisSessionStore {
     reason = "test code — panics are acceptable failures"
 )]
 mod tests {
-    use super::connection_info;
+    use super::{connection_info, graph_context_key, session_key, trace_key};
+    use uuid::Uuid;
 
     #[test]
     fn credentials_with_url_reserved_characters_are_passed_verbatim() {
@@ -578,9 +595,9 @@ mod tests {
             .await
             .unwrap();
         for key in [
-            session_key(Some(user), &session),
-            graph_context_key(Some(user), &session),
-            trace_key(user, &session),
+            session_key(Some(user), &session).unwrap(),
+            graph_context_key(Some(user), &session).unwrap(),
+            trace_key(user, &session).unwrap(),
         ] {
             let ttl: i64 = conn.ttl(&key).await.unwrap();
             assert!((1..=120).contains(&ttl), "{key}: ttl {ttl}");
@@ -593,7 +610,7 @@ mod tests {
             .create_qa_entry(&session, Some(user), "q", "a", None)
             .await
             .unwrap();
-        let key = session_key(Some(user), &session);
+        let key = session_key(Some(user), &session).unwrap();
         let ttl: i64 = conn.ttl(&key).await.unwrap();
         assert_eq!(ttl, -1);
         let _: () = conn.del(&key).await.unwrap();
@@ -607,5 +624,37 @@ mod tests {
         let info = connection_info("h", 1, "", "secret");
         assert_eq!(info.redis.username, None);
         assert_eq!(info.redis.password.as_deref(), Some("secret"));
+    }
+
+    // ── user-id ':' rejection keeps keys unambiguous ─────────────────────────
+
+    #[test]
+    fn colon_in_user_id_is_rejected_for_every_key_builder() {
+        assert!(session_key(Some("a:b"), "c").is_err());
+        assert!(graph_context_key(Some("a:b"), "c").is_err());
+        assert!(trace_key("a:b", "c").is_err());
+    }
+
+    #[test]
+    fn valid_user_ids_produce_the_same_keys_as_before() {
+        assert_eq!(session_key(None, "s").unwrap(), "agent_sessions:default:s");
+        let uuid = Uuid::new_v4().to_string();
+        assert_eq!(
+            session_key(Some(&uuid), "s").unwrap(),
+            format!("agent_sessions:{uuid}:s")
+        );
+        assert_eq!(
+            graph_context_key(Some(&uuid), "s").unwrap(),
+            format!("graph_knowledge:{uuid}:s")
+        );
+        assert_eq!(
+            trace_key(&uuid, "s").unwrap(),
+            format!("cognee:trace:{uuid}:s")
+        );
+        // A ':' in the session id is legal (last segment stays unambiguous).
+        assert_eq!(
+            session_key(Some("u"), "a:b").unwrap(),
+            "agent_sessions:u:a:b"
+        );
     }
 }
