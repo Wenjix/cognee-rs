@@ -387,9 +387,17 @@ impl UrlFetcher {
                 && let Some(Host::Domain(domain)) = current_url.host()
             {
                 let port = current_url.port_or_known_default().unwrap_or(80);
-                let resolved = lookup_host((domain, port)).await.map_err(|e| {
-                    UrlFetcherError::HttpError(format!("could not resolve {domain}: {e}"))
-                })?;
+                // Bound the pre-flight lookup by the fetch timeout — an
+                // unbounded resolve can outlive every retry budget.
+                let resolved =
+                    tokio::time::timeout(self.config.timeout, lookup_host((domain, port)))
+                        .await
+                        .map_err(|_| {
+                            UrlFetcherError::Timeout(format!("resolving {domain} timed out"))
+                        })?
+                        .map_err(|e| {
+                            UrlFetcherError::HttpError(format!("could not resolve {domain}: {e}"))
+                        })?;
                 let mut any = false;
                 for addr in resolved {
                     any = true;
