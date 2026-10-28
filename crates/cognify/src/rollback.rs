@@ -474,7 +474,12 @@ pub(crate) async fn on_run_failed(
 /// Never returns an error: the run completed.
 pub(crate) async fn on_run_completed(ctx: &RunContext<'_>, report: &FailureReport) {
     let scope = ctx.config.rollback_scope;
-    let outstanding = outstanding_items(report);
+    // Membership-only view for the survivor filter below: `processed` is
+    // scanned once, so a Vec here would make the filter O(processed x
+    // outstanding) on large partially-failed runs.
+    let outstanding = outstanding_items(report)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
 
     if let SweepDecision::Items(items) = decide_sweep(scope, &RunEnding::Completed(report))
         && let Some(run_id) = ctx.sweepable_run_id()

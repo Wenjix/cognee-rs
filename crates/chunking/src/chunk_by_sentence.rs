@@ -11,6 +11,17 @@ use crate::chunk_by_word::{WordType, chunk_by_word};
 use crate::cut_type::CutType;
 use crate::token_counter::{TokenCountMode, TokenCounter};
 
+/// Caps confirmation-recount work per chunk at this multiple of the chunk's
+/// span bytes. Under `TokenCountMode::Span` a suspected overflow is confirmed
+/// by recounting the whole accumulated span; with a counter whose span count
+/// barely grows (no whitespace between tokens, e.g. CJK text) a false alarm
+/// can repeat every few words over an ever-growing span — quadratic work.
+/// Past the budget a suspected overflow is treated as real (the chunk is
+/// cut), so the total recount bytes per chunk stay within `FACTOR` times
+/// the chunk's largest span — at most ~`FACTOR` recounts when spans are
+/// near-equal.
+pub(crate) const RECOUNT_BUDGET_FACTOR: usize = 8;
+
 /// A sentence-level chunk with metadata. Borrows text from the input.
 #[derive(Debug, Clone)]
 pub struct SentenceChunk<'a> {
@@ -84,6 +95,9 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
     // Track the byte range of the current sentence in `data`.
     let mut sentence_start: Option<usize> = None;
     let mut sentence_end: usize = 0;
+    // Bytes passed to Span confirmation recounts for the current sentence;
+    // reset whenever a sentence is emitted/started (see RECOUNT_BUDGET_FACTOR).
+    let mut recount_scanned: usize = 0;
 
     // Size of the slice about to be emitted, in whichever unit `mode` reports.
     let emitted_size = |start: usize, end: usize, accumulated: usize| match mode {
@@ -126,10 +140,17 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
             && let Some(start) = sentence_start
             && let Some(max) = maximum_size
         {
-            let exact_with_word = counter.count_tokens(&data[start..word_end_byte]);
-            if exact_with_word <= max {
-                overflows = false;
-                next_size = exact_with_word;
+            let len = word_end_byte - start;
+            if recount_scanned + len > RECOUNT_BUDGET_FACTOR * len {
+                // Recount budget exhausted: treat the suspected overflow as
+                // real rather than scanning the whole span again.
+            } else {
+                recount_scanned += len;
+                let exact_with_word = counter.count_tokens(&data[start..word_end_byte]);
+                if exact_with_word <= max {
+                    overflows = false;
+                    next_size = exact_with_word;
+                }
             }
         }
 
@@ -144,6 +165,7 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
             sentence_start = Some(word_start_byte);
             sentence_end = word_end_byte;
             sentence_size = word_size;
+            recount_scanned = 0;
             continue;
         }
 
@@ -168,6 +190,7 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
             });
             sentence_start = None;
             sentence_size = 0;
+            recount_scanned = 0;
         } else {
             if sentence_start.is_none() {
                 sentence_start = Some(word_start_byte);
