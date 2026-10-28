@@ -22,7 +22,90 @@ mod xlsx;
 use async_trait::async_trait;
 use cognee_models::Document;
 
+#[cfg(any(
+    feature = "unstructured-docx",
+    feature = "unstructured-epub",
+    feature = "unstructured-odp",
+    feature = "unstructured-odt",
+    feature = "unstructured-pptx"
+))]
+use std::io::Read;
+
 use super::{DocumentLoader, LoaderError, LoaderOutput};
+
+/// Why an entry could not be read: the shared decompression budget ran out
+/// ([`EntryReadError::LimitExceeded`]) — which must abort the whole
+/// document — or an ordinary read/UTF-8 failure ([`EntryReadError::Read`]),
+/// which a caller like the EPUB chapter loop may still skip.
+#[cfg(any(
+    feature = "unstructured-docx",
+    feature = "unstructured-epub",
+    feature = "unstructured-odp",
+    feature = "unstructured-odt",
+    feature = "unstructured-pptx"
+))]
+enum EntryReadError {
+    LimitExceeded(LoaderError),
+    Read(LoaderError),
+}
+
+#[cfg(any(
+    feature = "unstructured-docx",
+    feature = "unstructured-epub",
+    feature = "unstructured-odp",
+    feature = "unstructured-odt",
+    feature = "unstructured-pptx"
+))]
+impl From<EntryReadError> for LoaderError {
+    fn from(e: EntryReadError) -> LoaderError {
+        match e {
+            EntryReadError::LimitExceeded(e) | EntryReadError::Read(e) => e,
+        }
+    }
+}
+
+/// Reads one ZIP entry as a string against a shared per-document
+/// decompression `budget` (M14 — zip-bomb guard): each extractor hands the
+/// same budget to every entry it reads, so one document cannot expand into
+/// more text than the extraction limit. The budget is charged for whatever
+/// was decompressed even when the entry turns out not to be UTF-8, so a run
+/// of bad entries cannot each inflate the full limit.
+#[cfg(any(
+    feature = "unstructured-docx",
+    feature = "unstructured-epub",
+    feature = "unstructured-odp",
+    feature = "unstructured-odt",
+    feature = "unstructured-pptx"
+))]
+fn read_entry_to_string(
+    entry: impl Read,
+    name: &str,
+    budget: &mut usize,
+) -> Result<String, EntryReadError> {
+    let mut bytes = Vec::new();
+    // `read_to_end` keeps partial bytes in `bytes` on an I/O error — charge
+    // them (and enforce the limit) either way, so a document of many
+    // corrupt entries cannot each decompress up to the remaining budget.
+    let read_result = entry.take(*budget as u64 + 1).read_to_end(&mut bytes);
+    if bytes.len() > *budget {
+        return Err(EntryReadError::LimitExceeded(
+            LoaderError::ExtractionFailed(format!(
+                "{name}: decompressed size exceeds the {budget}-byte extraction limit"
+            )),
+        ));
+    }
+    *budget -= bytes.len();
+    read_result.map_err(|e| {
+        EntryReadError::Read(LoaderError::ExtractionFailed(format!(
+            "Failed to read '{name}': {e}"
+        )))
+    })?;
+    String::from_utf8(bytes).map_err(|e| {
+        EntryReadError::Read(LoaderError::ExtractionFailed(format!(
+            "Failed to read '{name}': {e}"
+        )))
+    })
+}
 
 /// Loader for unstructured document formats (XLSX, DOCX, PPTX, EPUB, EML, ODT, ODP).
 ///
@@ -123,6 +206,35 @@ fn dispatch_by_extension(ext: &str, bytes: &[u8]) -> Result<String, LoaderError>
     }
 }
 
+/// Builds a deflate-compressed ZIP from `(name, bytes)` pairs — lets the
+/// extractor tests feed a tiny archive whose entry expands far past the
+/// injected limit.
+#[cfg(all(
+    test,
+    any(
+        feature = "unstructured-docx",
+        feature = "unstructured-epub",
+        feature = "unstructured-odp",
+        feature = "unstructured-odt",
+        feature = "unstructured-pptx"
+    )
+))]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper — panics are acceptable failures"
+)]
+pub(super) fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in entries {
+        writer.start_file(*name, options).unwrap();
+        writer.write_all(data).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -132,7 +244,40 @@ fn dispatch_by_extension(ext: &str, bytes: &[u8]) -> Result<String, LoaderError>
 mod tests {
     use super::*;
     use cognee_models::DataPoint;
+    use std::io;
     use uuid::Uuid;
+
+    /// Yields `fail_after` bytes then an I/O error — for the budget test.
+    struct FailAfterN {
+        remaining: usize,
+    }
+
+    impl Read for FailAfterN {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom"));
+            }
+            let n = self.remaining.min(buf.len());
+            buf[..n].fill(b'x');
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    /// An I/O error after a partial read must still charge the bytes it
+    /// decompressed — otherwise a document of corrupt entries can expand far
+    /// past the budget (R-bot feedback on M14).
+    #[cfg(feature = "unstructured-epub")]
+    #[test]
+    fn a_failed_entry_read_still_charges_its_bytes() {
+        let mut budget = 1_000usize;
+        let result = read_entry_to_string(FailAfterN { remaining: 300 }, "x", &mut budget);
+        assert!(
+            matches!(result, Err(EntryReadError::Read(_))),
+            "expected a non-limit read error"
+        );
+        assert_eq!(budget, 700, "the 300 partially-read bytes must be charged");
+    }
 
     fn make_doc(ext: &str) -> Document {
         Document {

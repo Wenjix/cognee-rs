@@ -5,7 +5,7 @@
 //! spine for chapter order, reads each chapter's XHTML, and strips
 //! HTML tags using `scraper`. Chapters are joined with `"\n\n"`.
 
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 use scraper::{Html, Selector};
 
@@ -13,36 +13,47 @@ use super::super::LoaderError;
 
 /// Extract text from an EPUB file.
 pub(crate) fn extract(bytes: &[u8]) -> Result<String, LoaderError> {
+    extract_with_limit(bytes, super::super::MAX_EXTRACTED_BYTES)
+}
+
+fn extract_with_limit(bytes: &[u8], limit: usize) -> Result<String, LoaderError> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| LoaderError::ExtractionFailed(format!("Failed to open EPUB as ZIP: {e}")))?;
 
+    // One decompression budget across container, OPF and every chapter (M14).
+    let mut budget = limit;
+
     // Step 1: Read META-INF/container.xml to find the OPF file path
-    let opf_path = find_opf_path(&mut archive)?;
+    let opf_path = find_opf_path(&mut archive, &mut budget)?;
 
     // Determine the base directory of the OPF file for resolving relative paths
     let opf_dir = opf_path.rfind('/').map(|i| &opf_path[..=i]).unwrap_or("");
     let opf_dir = opf_dir.to_string();
 
     // Step 2: Read the OPF file and parse the spine/manifest
-    let opf_content = read_zip_entry(&mut archive, &opf_path)?;
+    let opf_content = read_zip_entry(&mut archive, &opf_path, &mut budget)?;
     let chapter_paths = parse_opf_spine(&opf_content, &opf_dir)?;
 
     // Step 3: Read each chapter and strip HTML
     let mut elements: Vec<String> = Vec::new();
     for path in &chapter_paths {
-        match read_zip_entry(&mut archive, path) {
-            Ok(html_content) => {
-                let text = strip_html(&html_content);
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
-                    elements.push(trimmed);
-                }
-            }
-            Err(_) => {
-                // Some spine items may reference non-existent files; skip them
-                continue;
-            }
+        // Some spine items may reference missing or unreadable files; skip
+        // those (as before) — but an exhausted decompression budget aborts
+        // the whole document.
+        let file = match archive.by_name(path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let html_content = match super::read_entry_to_string(file, path, &mut budget) {
+            Ok(content) => content,
+            Err(super::EntryReadError::Read(_)) => continue,
+            Err(super::EntryReadError::LimitExceeded(e)) => return Err(e),
+        };
+        let text = strip_html(&html_content);
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            elements.push(trimmed);
         }
     }
 
@@ -53,20 +64,20 @@ pub(crate) fn extract(bytes: &[u8]) -> Result<String, LoaderError> {
 fn read_zip_entry(
     archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
     name: &str,
+    budget: &mut usize,
 ) -> Result<String, LoaderError> {
-    let mut content = String::new();
-    let mut file = archive.by_name(name).map_err(|e| {
+    let file = archive.by_name(name).map_err(|e| {
         LoaderError::ExtractionFailed(format!("Failed to find '{name}' in EPUB: {e}"))
     })?;
-    file.read_to_string(&mut content).map_err(|e| {
-        LoaderError::ExtractionFailed(format!("Failed to read '{name}' in EPUB: {e}"))
-    })?;
-    Ok(content)
+    Ok(super::read_entry_to_string(file, name, budget)?)
 }
 
 /// Find the OPF file path from `META-INF/container.xml`.
-fn find_opf_path(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<String, LoaderError> {
-    let container_xml = read_zip_entry(archive, "META-INF/container.xml")?;
+fn find_opf_path(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    budget: &mut usize,
+) -> Result<String, LoaderError> {
+    let container_xml = read_zip_entry(archive, "META-INF/container.xml", budget)?;
 
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -284,5 +295,94 @@ mod tests {
     fn empty_bytes_returns_error() {
         let result = extract(b"");
         assert!(result.is_err());
+    }
+
+    fn minimal_epub(chapter: &[u8]) -> Vec<u8> {
+        let container = br#"<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+        let opf = br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf"><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#;
+        super::super::zip_bytes(&[
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/c1.xhtml", chapter),
+        ])
+    }
+
+    #[test]
+    fn a_decompressed_chapter_past_the_limit_is_rejected() {
+        // Container + OPF read fine; the chapter blows the shared budget.
+        let zip = minimal_epub(&vec![b' '; 2_000_000]);
+        assert!(matches!(
+            extract_with_limit(&zip, 1_000_000),
+            Err(LoaderError::ExtractionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn a_small_document_extracts_exactly_as_before() {
+        let zip = minimal_epub(b"<html><body><p>hi there</p></body></html>");
+        let text = extract_with_limit(&zip, 1_000_000).unwrap();
+        assert!(text.contains("hi there"), "{text:?}");
+    }
+
+    fn epub_with_chapters(chapters: &[(&str, &[u8])]) -> Vec<u8> {
+        let container = br#"<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+        let manifest: String = chapters
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| {
+                format!(r#"<item id="c{i}" href="{name}" media-type="application/xhtml+xml"/>"#)
+            })
+            .collect();
+        let spine: String = chapters
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!(r#"<itemref idref="c{i}"/>"#))
+            .collect();
+        let opf = format!(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf"><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+        );
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf.as_bytes()),
+        ];
+        for (name, body) in chapters {
+            entries.push((Box::leak(format!("OEBPS/{name}").into_boxed_str()), body));
+        }
+        super::super::zip_bytes(&entries)
+    }
+
+    #[test]
+    fn a_non_utf8_chapter_is_skipped_like_before() {
+        // Latin-1 bytes are not valid UTF-8: the chapter is skipped (main's
+        // `Err(_) => continue` behaviour), the rest still extracts.
+        let zip = epub_with_chapters(&[
+            ("bad.xhtml", &[0xE9u8, 0xE8, 0x20, 0xFF]),
+            (
+                "OEBPS/good.xhtml",
+                b"<html><body><p>hi there</p></body></html>",
+            ),
+        ]);
+        let text = extract_with_limit(&zip, 1_000_000).unwrap();
+        assert!(text.contains("hi there"), "{text:?}");
+    }
+
+    #[test]
+    fn bad_chapters_still_count_against_the_budget() {
+        // Each bad chapter is skipped, but the bytes it decompressed are
+        // charged — enough of them must trip the limit rather than inflate
+        // unbounded work.
+        let bad: Vec<u8> = vec![0xFF; 200_000];
+        let chapters: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|i| (format!("bad{i}.xhtml"), bad.clone()))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = chapters
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        let zip = epub_with_chapters(&refs);
+        assert!(matches!(
+            extract_with_limit(&zip, 1_000_000),
+            Err(LoaderError::ExtractionFailed(_))
+        ));
     }
 }

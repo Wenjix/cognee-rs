@@ -25,6 +25,14 @@ use async_trait::async_trait;
 use cognee_models::Document;
 use thiserror::Error;
 
+/// Per-document cap on the text a loader may build or decompress (DoS
+/// guard): a small archive can expand into gigabytes of XML, and a CSV
+/// with a long header × many rows can multiply into far more memory than
+/// its input. Extraction fails with [`LoaderError::ExtractionFailed`]
+/// once a document would exceed this.
+#[cfg(any(feature = "csv-loader", feature = "unstructured"))]
+pub(crate) const MAX_EXTRACTED_BYTES: usize = 256 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------

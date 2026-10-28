@@ -4,7 +4,7 @@
 //! and extracts text from `<w:t>` elements within `<w:p>` paragraphs.
 //! Paragraphs are joined with `"\n\n"`.
 
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
@@ -16,19 +16,21 @@ const WORD_NS: &[u8] = b"http://schemas.openxmlformats.org/wordprocessingml/2006
 
 /// Extract text from a DOCX file.
 pub(crate) fn extract(bytes: &[u8]) -> Result<String, LoaderError> {
+    extract_with_limit(bytes, super::super::MAX_EXTRACTED_BYTES)
+}
+
+fn extract_with_limit(bytes: &[u8], limit: usize) -> Result<String, LoaderError> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| LoaderError::ExtractionFailed(format!("Failed to open DOCX as ZIP: {e}")))?;
 
-    let mut xml_content = String::new();
-    {
-        let mut file = archive.by_name("word/document.xml").map_err(|e| {
+    let mut budget = limit;
+    let xml_content = {
+        let file = archive.by_name("word/document.xml").map_err(|e| {
             LoaderError::ExtractionFailed(format!("Failed to find word/document.xml in DOCX: {e}"))
         })?;
-        file.read_to_string(&mut xml_content).map_err(|e| {
-            LoaderError::ExtractionFailed(format!("Failed to read word/document.xml: {e}"))
-        })?;
-    }
+        super::read_entry_to_string(file, "word/document.xml", &mut budget)?
+    };
 
     parse_docx_xml(&xml_content)
 }
@@ -176,5 +178,25 @@ mod tests {
     fn empty_bytes_returns_error() {
         let result = extract(b"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_decompressed_entry_past_the_limit_is_rejected() {
+        // ~2 MB of spaces compresses to a few KB — a zip bomb the unbounded
+        // read_to_string would happily inflate.
+        let big = vec![b' '; 2_000_000];
+        let zip = super::super::zip_bytes(&[("word/document.xml", big.as_slice())]);
+        assert!(matches!(
+            extract_with_limit(&zip, 1_000_000),
+            Err(LoaderError::ExtractionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn a_small_document_extracts_exactly_as_before() {
+        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>hi there</w:t></w:r></w:p></w:body></w:document>"#;
+        let zip = super::super::zip_bytes(&[("word/document.xml", xml)]);
+        let text = extract_with_limit(&zip, 1_000_000).unwrap();
+        assert!(text.contains("hi there"), "{text:?}");
     }
 }
