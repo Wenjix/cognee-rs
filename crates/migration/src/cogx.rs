@@ -431,6 +431,21 @@ impl CogxArchiveWriter {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let path = directory.join(file_name);
+                // A planted symlink at an owned file's path must not be
+                // written through into wherever it points.
+                if path
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return Err(MigrationError::io(
+                        path.clone(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "refusing to archive a symlink or non-regular file",
+                        ),
+                    ));
+                }
                 let file = File::create(&path).map_err(|error| MigrationError::io(path, error))?;
                 entry.insert(BufWriter::new(file))
             }
@@ -456,6 +471,19 @@ impl CogxArchiveWriter {
             notes: std::mem::take(&mut self.notes),
         };
         let path = self.directory.join(MANIFEST_FILE);
+        if path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(MigrationError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to archive a symlink or non-regular file",
+                ),
+            ));
+        }
         let body = serde_json::to_string_pretty(&manifest)?;
         fs::write(&path, body).map_err(|error| MigrationError::io(path, error))?;
         Ok(manifest)

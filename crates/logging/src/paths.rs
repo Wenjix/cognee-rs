@@ -55,13 +55,47 @@ pub fn resolve_logs_dir(cfg: &crate::LoggingConfig) -> Option<PathBuf> {
         }
     }
 
-    // 3. /tmp/cognee_logs.
+    // 3. /tmp/cognee_logs — a shared location another local user can
+    // pre-create and plant symlinks in, so it gets extra checks.
     let tmp_candidate = PathBuf::from("/tmp").join("cognee_logs");
-    if let Some(p) = try_candidate(&tmp_candidate) {
+    if let Some(p) = try_tmp_candidate(&tmp_candidate) {
         return Some(p);
     }
 
     None
+}
+
+/// Probe name unique to this process and call: a predictable probe lets a
+/// local attacker plant a symlink the probe's `File::create` would truncate
+/// through.
+fn probe_path(dir: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dir.join(format!(
+        ".cognee_write_probe.{}.{}.{}",
+        std::process::id(),
+        nanos,
+        seq
+    ))
+}
+
+/// Write-probe `dir` with an exclusive uniquely-named file, removed
+/// afterwards. Returns the opened probe file and its path so callers can
+/// compare the directory's owner against the probe's.
+fn write_probe(dir: &Path) -> Option<(fs::File, PathBuf)> {
+    let probe = probe_path(dir);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => Some((file, probe)),
+        Err(_) => None,
+    }
 }
 
 /// Try a single candidate directory: `mkdir -p` then a write probe.
@@ -70,15 +104,55 @@ fn try_candidate(dir: &Path) -> Option<PathBuf> {
     if fs::create_dir_all(dir).is_err() {
         return None;
     }
-    let probe = dir.join(".cognee_write_probe");
-    match fs::File::create(&probe) {
-        Ok(_) => {
-            // Best-effort cleanup; ignore errors.
-            let _ = fs::remove_file(&probe);
-            Some(dir.to_path_buf())
+    let (file, probe) = write_probe(dir)?;
+    drop(file);
+    // Best-effort cleanup; ignore errors.
+    let _ = fs::remove_file(&probe);
+    Some(dir.to_path_buf())
+}
+
+/// The `/tmp/cognee_logs` fallback: shared and pre-creatable by any local
+/// user, so on unix it must be a real directory (not a symlink), owned by
+/// the effective user, and not group/world-writable — otherwise log files
+/// would land in a directory someone else controls.
+fn try_tmp_candidate(dir: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if dir.symlink_metadata().is_err() {
+            fs::DirBuilder::new().mode(0o700).create(dir).ok()?;
         }
-        Err(_) => None,
     }
+    #[cfg(not(unix))]
+    if fs::create_dir_all(dir).is_err() {
+        return None;
+    }
+
+    let (file, probe) = write_probe(dir)?;
+    // A file we just created carries our effective uid — compare the
+    // directory's owner against it rather than trusting a name.
+    #[cfg(unix)]
+    let probe_uid = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().ok()?.uid()
+    };
+    drop(file);
+    let _ = fs::remove_file(&probe);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir_meta = dir.symlink_metadata().ok()?;
+        if !dir_meta.file_type().is_dir()
+            || dir_meta.file_type().is_symlink()
+            || dir_meta.uid() != probe_uid
+            || dir_meta.mode() & 0o022 != 0
+        {
+            return None;
+        }
+    }
+
+    Some(dir.to_path_buf())
 }
 
 /// Resolve the active log file path for this process.
@@ -422,5 +496,49 @@ mod tests {
             .flatten()
             .count();
         assert_eq!(count, 3, "no files removed below threshold");
+    }
+
+    /// The probe no longer uses a predictable path: a pre-planted
+    /// `.cognee_write_probe` symlink to a sentinel is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_preplanted_probe_symlink_is_never_truncated() {
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "precious").unwrap();
+        std::os::unix::fs::symlink(&sentinel, dir.path().join(".cognee_write_probe")).unwrap();
+
+        assert!(try_candidate(dir.path()).is_some());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "precious");
+    }
+
+    /// A group/world-writable shared directory is rejected for the /tmp
+    /// fallback; a normal user-owned one passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_by_others_dir_is_rejected_for_the_shared_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(try_tmp_candidate(dir.path()).is_none());
+    }
+
+    /// A missing candidate is created owner-only and accepted; a symlink
+    /// standing in for the directory is rejected.
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_fallback_requires_a_real_owned_dir() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("cognee_logs");
+        let resolved = try_tmp_candidate(&missing).unwrap();
+        assert_eq!(resolved, missing);
+        assert_eq!(missing.metadata().unwrap().mode() & 0o777, 0o700);
+
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(try_tmp_candidate(&link).is_none());
     }
 }
