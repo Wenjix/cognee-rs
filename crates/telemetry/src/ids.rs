@@ -121,14 +121,29 @@ mod inner {
         let fresh = Uuid::new_v4().to_string();
         // A planted symlink or otherwise strange `.anon_id` must neither be
         // read through nor written through: fall back to an in-memory id.
-        read_or_create_id_file(&path, &fresh).unwrap_or_else(|| Uuid::new_v4().to_string())
+        read_or_create_id_file(&path, &fresh, IdRule::Uuid)
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
     }
 
-    /// The UUID stored at `path`, creating it with `fresh` when nothing is
-    /// there. Never follows a symlink and never overwrites an existing
-    /// entry: anything that is not a regular file holding one UUID yields
-    /// `None`, and the caller uses an in-memory id for this process.
-    pub(super) fn read_or_create_id_file(path: &Path, fresh: &str) -> Option<String> {
+    /// What an id file may contain. `.anon_id` files hold a UUID;
+    /// `.persistent_id` files may hold a configured tracking id instead —
+    /// `get_anonymous_id` seeds them, and a configured `tracking_id` is any
+    /// token, not necessarily a UUID.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) enum IdRule {
+        /// Exactly one parseable UUID.
+        Uuid,
+        /// Any non-empty token: after trim, 1..=64 bytes, no ASCII control
+        /// characters or whitespace.
+        Token,
+    }
+
+    /// The identifier stored at `path`, creating it with `fresh` when
+    /// nothing is there. Never follows a symlink and never overwrites an
+    /// existing entry: anything that is not a regular file holding an id
+    /// `rule` accepts yields `None`, and the caller uses an in-memory id
+    /// for this process.
+    pub(super) fn read_or_create_id_file(path: &Path, fresh: &str, rule: IdRule) -> Option<String> {
         const MAX_ID_LEN: u64 = 64;
 
         let meta = match std::fs::symlink_metadata(path) {
@@ -201,6 +216,7 @@ mod inner {
                 _ => return None,
             }
         }
+        use std::io::Read as _;
         let mut buf = String::new();
         if std::io::Read::take(file, MAX_ID_LEN + 1)
             .read_to_string(&mut buf)
@@ -209,13 +225,23 @@ mod inner {
             return None;
         }
         let id = buf.trim();
-        if Uuid::parse_str(id).is_ok() {
+        let valid = match rule {
+            IdRule::Uuid => Uuid::parse_str(id).is_ok(),
+            IdRule::Token => {
+                !id.is_empty()
+                    && id.len() <= MAX_ID_LEN as usize
+                    && id
+                        .bytes()
+                        .all(|b| !b.is_ascii_control() && !b.is_ascii_whitespace())
+            }
+        };
+        if valid {
             Some(id.to_string())
         } else {
             tracing::debug!(
                 target: "cognee.telemetry",
                 path = %path.display(),
-                "id file does not hold a UUID; using an in-memory id"
+                "id file does not hold a usable identifier; using an in-memory id"
             );
             None
         }
@@ -277,7 +303,7 @@ mod inner {
         if fresh == "unknown-anonymous-id" {
             fresh = Uuid::new_v4().to_string();
         }
-        read_or_create_id_file(&path, &fresh).unwrap_or_else(get_anonymous_id)
+        read_or_create_id_file(&path, &fresh, IdRule::Token).unwrap_or_else(get_anonymous_id)
     }
 
     /// Computed tracking ids, keyed by `(key, salt)`. PBKDF2 at 100k
@@ -508,10 +534,12 @@ pub(crate) use inner::api_key_tracking_id_with_salt as inner_api_key_tracking_id
     reason = "tests drive configuration through the process env"
 )]
 mod ids_tests {
+    use super::inner::IdRule;
     use super::*;
     use crate::{TelemetryConfig, configure, current_config};
     use serial_test::serial;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     /// Restores HOME, the process telemetry configuration and the registered
     /// LLM key around each test, so tests do not leak into each other.
@@ -731,7 +759,10 @@ mod ids_tests {
         let link = dir.path().join(".anon_id");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
 
-        assert!(inner::read_or_create_id_file(&link, &Uuid::new_v4().to_string()).is_none());
+        assert!(
+            inner::read_or_create_id_file(&link, &Uuid::new_v4().to_string(), IdRule::Uuid)
+                .is_none()
+        );
         assert_eq!(
             std::fs::read_to_string(&secret).unwrap(),
             "not-a-uuid-secret"
@@ -740,7 +771,10 @@ mod ids_tests {
         // A dangling symlink is unsafe to create through as well.
         let dangling = dir.path().join("dangling");
         std::os::unix::fs::symlink(dir.path().join("absent"), &dangling).unwrap();
-        assert!(inner::read_or_create_id_file(&dangling, &Uuid::new_v4().to_string()).is_none());
+        assert!(
+            inner::read_or_create_id_file(&dangling, &Uuid::new_v4().to_string(), IdRule::Uuid)
+                .is_none()
+        );
         assert!(
             dangling
                 .symlink_metadata()
@@ -759,7 +793,10 @@ mod ids_tests {
         let link = dir.path().join(".anon_id");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert!(inner::read_or_create_id_file(&link, &Uuid::new_v4().to_string()).is_none());
+        assert!(
+            inner::read_or_create_id_file(&link, &Uuid::new_v4().to_string(), IdRule::Uuid)
+                .is_none()
+        );
         assert_eq!(std::fs::read(&target).unwrap(), vec![0xFF, 0xFE, 0x01]);
     }
 
@@ -770,7 +807,7 @@ mod ids_tests {
         let id = Uuid::new_v4().to_string();
         std::fs::write(&path, format!("  {id}\n")).unwrap();
         assert_eq!(
-            inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string()),
+            inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string(), IdRule::Uuid),
             Some(id)
         );
     }
@@ -780,7 +817,10 @@ mod ids_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".anon_id");
         std::fs::write(&path, "garbage").unwrap();
-        assert!(inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string()).is_none());
+        assert!(
+            inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string(), IdRule::Uuid)
+                .is_none()
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "garbage");
     }
 
@@ -790,14 +830,43 @@ mod ids_tests {
         let path = dir.path().join(".anon_id");
         let fresh = Uuid::new_v4().to_string();
         assert_eq!(
-            inner::read_or_create_id_file(&path, &fresh),
+            inner::read_or_create_id_file(&path, &fresh, IdRule::Uuid),
             Some(fresh.clone())
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh);
         // Second call reads the file back instead of minting a new one.
         assert_eq!(
-            inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string()),
+            inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string(), IdRule::Uuid),
             Some(fresh)
         );
+    }
+
+    /// `.persistent_id` files may hold a configured tracking id — any token,
+    /// not only a UUID — so `IdRule::Token` reuses it.
+    #[test]
+    fn persistent_id_reuses_a_configured_tracking_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".persistent_id");
+        std::fs::write(&path, "my-tracking-id").unwrap();
+        assert_eq!(
+            inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string(), IdRule::Token),
+            Some("my-tracking-id".to_string())
+        );
+    }
+
+    /// ...but control characters, whitespace and oversized content are not
+    /// a token — the file is rejected and `fresh` must not be trusted back.
+    #[test]
+    fn persistent_id_rejects_control_whitespace_and_oversized_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        for contents in ["bad\nvalue", "has space", &"x".repeat(100)] {
+            let path = dir.path().join(".persistent_id");
+            std::fs::write(&path, contents).unwrap();
+            assert!(
+                inner::read_or_create_id_file(&path, &Uuid::new_v4().to_string(), IdRule::Token)
+                    .is_none(),
+                "{contents:?} must be rejected"
+            );
+        }
     }
 }

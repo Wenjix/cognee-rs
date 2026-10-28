@@ -120,7 +120,13 @@ fn try_tmp_candidate(dir: &Path) -> Option<PathBuf> {
     {
         use std::os::unix::fs::DirBuilderExt;
         if dir.symlink_metadata().is_err() {
-            fs::DirBuilder::new().mode(0o700).create(dir).ok()?;
+            // `AlreadyExists` is fine — another process won the create race;
+            // the ownership/mode checks below decide if the dir is usable.
+            match fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
         }
     }
     #[cfg(not(unix))]

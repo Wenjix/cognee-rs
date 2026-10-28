@@ -161,7 +161,10 @@ mod tests {
     }
 
     /// An export whose destination already holds a symlink at an owned
-    /// record-file name must error rather than write through it.
+    /// record-file name must error rather than write through it. The symlink
+    /// is planted *after* `new()` — the constructor legitimately unlinks
+    /// owned names, so a pre-construction plant never reaches the write
+    /// path; the post-construction window is the real attack.
     #[cfg(unix)]
     #[test]
     fn a_planted_symlink_in_the_export_directory_errors() {
@@ -170,9 +173,12 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, "precious").unwrap();
-        std::os::unix::fs::symlink(&victim, out.join("nodes.jsonl")).unwrap();
 
         let mut writer = crate::cogx::CogxArchiveWriter::new(&out).unwrap();
+        // Plant the symlink after the constructor cleaned the owned names —
+        // O_EXCL must refuse to open it.
+        std::os::unix::fs::symlink(&victim, out.join("nodes.jsonl")).unwrap();
+
         let result = writer.write_raw_node(&serde_json::json!({"id": 1}));
         assert!(result.is_err(), "export must refuse the planted symlink");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
