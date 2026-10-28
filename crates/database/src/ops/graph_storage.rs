@@ -798,19 +798,32 @@ pub async fn get_nodes_unique_to_dataset(
 pub async fn get_edges_unique_to_dataset(
     db: &DatabaseConnection,
     dataset_id: Uuid,
+    dying_pairs: &[(Uuid, Uuid)],
 ) -> Result<Vec<GraphEdge>, DatabaseError> {
     Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
     let dataset_hex = uuid_hex::to_hex(dataset_id);
+    let pair_hexes: Vec<(String, String)> = dying_pairs
+        .iter()
+        .map(|(d, x)| (uuid_hex::to_hex(*d), uuid_hex::to_hex(*x)))
+        .collect();
 
     let e2 = Alias::new("e2");
+    let mut outside_claim = Condition::all()
+        .add(Expr::col((e2.clone(), edge::Column::DatasetId)).ne(dataset_hex.clone()))
+        .add(edge_row_is_live_claim(&e2));
+    if !pair_hexes.is_empty() {
+        // A structural row a scope pair owns dies with this request — it is
+        // not a surviving claim (see [`structural_owned_by_scope_pairs`]).
+        outside_claim = outside_claim.add(structural_owned_by_scope_pairs(&e2, &pair_hexes).not());
+    }
     let claimed = Query::select()
         .expr(Expr::val(1))
         .from_as(Alias::new("edges"), e2.clone())
-        .and_where(Expr::col((e2.clone(), edge::Column::DatasetId)).ne(dataset_hex.clone()))
         .and_where(
             Expr::col((e2.clone(), edge::Column::Slug))
                 .equals((Alias::new("edges"), edge::Column::Slug)),
         )
+        .and_where(outside_claim.into())
         .to_owned();
 
     let rows: Vec<GraphEdge> = edge::Entity::find()
@@ -896,12 +909,27 @@ pub async fn get_edges_unique_to_data_in_store(
     db: &DatabaseConnection,
     data_id: Uuid,
     dataset_id: Uuid,
+    dying_pairs: &[(Uuid, Uuid)],
 ) -> Result<Vec<GraphEdge>, DatabaseError> {
     Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
     let data_hex = uuid_hex::to_hex(data_id);
     let dataset_hex = uuid_hex::to_hex(dataset_id);
+    let pair_hexes: Vec<(String, String)> = dying_pairs
+        .iter()
+        .map(|(d, x)| (uuid_hex::to_hex(*d), uuid_hex::to_hex(*x)))
+        .collect();
 
     let e2 = Alias::new("e2");
+    let mut outside_claim = Condition::all()
+        .add(
+            Condition::any()
+                .add(Expr::col((e2.clone(), edge::Column::DatasetId)).ne(dataset_hex.clone()))
+                .add(Expr::col((e2.clone(), edge::Column::DataId)).ne(data_hex.clone())),
+        )
+        .add(edge_row_is_live_claim(&e2));
+    if !pair_hexes.is_empty() {
+        outside_claim = outside_claim.add(structural_owned_by_scope_pairs(&e2, &pair_hexes).not());
+    }
     let claimed = Query::select()
         .expr(Expr::val(1))
         .from_as(Alias::new("edges"), e2.clone())
@@ -909,12 +937,7 @@ pub async fn get_edges_unique_to_data_in_store(
             Expr::col((e2.clone(), edge::Column::Slug))
                 .equals((Alias::new("edges"), edge::Column::Slug)),
         )
-        .and_where(
-            Condition::any()
-                .add(Expr::col((e2.clone(), edge::Column::DatasetId)).ne(dataset_hex.clone()))
-                .add(Expr::col((e2.clone(), edge::Column::DataId)).ne(data_hex.clone()))
-                .into(),
-        )
+        .and_where(outside_claim.into())
         .to_owned();
 
     let rows: Vec<GraphEdge> = edge::Entity::find()
@@ -949,15 +972,25 @@ pub async fn get_edges_unique_to_data_in_store(
 pub async fn get_edge_retrieval_texts_claimed_outside_dataset(
     db: &DatabaseConnection,
     dataset_id: Uuid,
+    dying_pairs: &[(Uuid, Uuid)],
     candidates: &[String],
 ) -> Result<Vec<String>, DatabaseError> {
     Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
     let dataset_hex = uuid_hex::to_hex(dataset_id);
+    let pair_hexes: Vec<(String, String)> = dying_pairs
+        .iter()
+        .map(|(d, x)| (uuid_hex::to_hex(*d), uuid_hex::to_hex(*x)))
+        .collect();
     let wanted: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+    let e = Alias::new("edges");
     let surviving = || {
-        Condition::all()
-            .add(edge::Column::DatasetId.ne(&dataset_hex))
-            .add(edge_row_is_live_claim())
+        let mut cond = Condition::all()
+            .add(Expr::col((e.clone(), edge::Column::DatasetId)).ne(&dataset_hex))
+            .add(edge_row_is_live_claim(&e));
+        if !pair_hexes.is_empty() {
+            cond = cond.add(structural_owned_by_scope_pairs(&e, &pair_hexes).not());
+        }
+        cond
     };
 
     let mut claimed = BTreeSet::new();
@@ -1175,14 +1208,19 @@ pub async fn get_edges_unique_to_scope(
         .collect();
 
     let e2 = Alias::new("e2");
-    let outside = in_delete_scope(
+    let mut dying = in_delete_scope(
         &e2,
         edge::Column::DatasetId,
         edge::Column::DataId,
         &dataset_hexes,
         &pair_hexes,
-    )
-    .not();
+    );
+    if !pair_hexes.is_empty() {
+        dying = dying.add(structural_owned_by_scope_pairs(&e2, &pair_hexes));
+    }
+    let outside = Condition::all()
+        .add(dying.not())
+        .add(edge_row_is_live_claim(&e2));
     let claimed = Query::select()
         .expr(Expr::val(1))
         .from_as(Alias::new("edges"), e2.clone())
@@ -1239,19 +1277,20 @@ pub async fn get_edge_retrieval_texts_claimed_outside_scope(
         .collect();
     let wanted: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
     let e = Alias::new("edges");
+    let mut dying = in_delete_scope(
+        &e,
+        edge::Column::DatasetId,
+        edge::Column::DataId,
+        &dataset_hexes,
+        &pair_hexes,
+    );
+    if !pair_hexes.is_empty() {
+        dying = dying.add(structural_owned_by_scope_pairs(&e, &pair_hexes));
+    }
     let surviving = || {
         Condition::all()
-            .add(
-                in_delete_scope(
-                    &e,
-                    edge::Column::DatasetId,
-                    edge::Column::DataId,
-                    &dataset_hexes,
-                    &pair_hexes,
-                )
-                .not(),
-            )
-            .add(edge_row_is_live_claim())
+            .add(dying.clone().not())
+            .add(edge_row_is_live_claim(&e))
     };
 
     let mut claimed = BTreeSet::new();
@@ -1301,13 +1340,16 @@ pub async fn get_edge_retrieval_texts_claimed_outside_scope(
     Ok(claimed.into_iter().collect())
 }
 
-/// `EXISTS (SELECT 1 FROM nodes AS n WHERE n.slug = edges.<endpoint> AND ...)`:
+/// `EXISTS (SELECT 1 FROM nodes AS n WHERE n.slug = <edge>.<endpoint> AND ...)`:
 /// whether some node row, narrowed by `narrow`, claims the edge row's
 /// `endpoint`. Correlated, so both backends can plan it per edge row through
 /// `ix_nodes_slug` (or `index_node_dataset_slug` when `narrow` pins the
-/// dataset) instead of materializing a slug list.
+/// dataset) instead of materializing a slug list. `edge_alias` names the
+/// edge table in the surrounding statement (`edges`, or an alias like `e2`
+/// when the predicate runs inside a subquery).
 fn endpoint_claimed(
     endpoint: edge::Column,
+    edge_alias: &Alias,
     narrow: impl FnOnce(&Alias) -> Vec<SimpleExpr>,
 ) -> SimpleExpr {
     let n = Alias::new("n");
@@ -1316,7 +1358,7 @@ fn endpoint_claimed(
         .expr(Expr::val(1))
         .from_as(Alias::new("nodes"), n.clone())
         .and_where(
-            Expr::col((n.clone(), node::Column::Slug)).equals((Alias::new("edges"), endpoint)),
+            Expr::col((n.clone(), node::Column::Slug)).equals((edge_alias.clone(), endpoint)),
         );
     for condition in narrow(&n) {
         claim.and_where(condition);
@@ -1328,7 +1370,12 @@ fn endpoint_claimed(
 /// that item's node rows claim it and no other item's node rows in the dataset
 /// do. This is exactly the set [`get_unique_nodes_for_data`] returns, which is
 /// the set a data-scoped delete detach-deletes from the graph.
-fn endpoint_exclusive_to(endpoint: edge::Column, data_hex: &str, dataset_hex: &str) -> Condition {
+fn endpoint_exclusive_to(
+    endpoint: edge::Column,
+    edge_alias: &Alias,
+    data_hex: &str,
+    dataset_hex: &str,
+) -> Condition {
     let in_dataset_with = |data_eq: bool| {
         move |n: &Alias| {
             let data = Expr::col((n.clone(), node::Column::DataId));
@@ -1343,8 +1390,12 @@ fn endpoint_exclusive_to(endpoint: edge::Column, data_hex: &str, dataset_hex: &s
         }
     };
     Condition::all()
-        .add(endpoint_claimed(endpoint, in_dataset_with(true)))
-        .add(endpoint_claimed(endpoint, in_dataset_with(false)).not())
+        .add(endpoint_claimed(
+            endpoint,
+            edge_alias,
+            in_dataset_with(true),
+        ))
+        .add(endpoint_claimed(endpoint, edge_alias, in_dataset_with(false)).not())
 }
 
 /// Selection predicate for the structural edge rows (`is_part_of`, `contains`,
@@ -1365,23 +1416,43 @@ fn endpoint_exclusive_to(endpoint: edge::Column, data_hex: &str, dataset_hex: &s
 ///
 /// Because the predicate reads the node rows, it has to be evaluated before
 /// the data item's node rows are deleted.
-fn structural_edges_owned_by(data_hex: &str, dataset_hex: &str) -> Condition {
+fn structural_edges_owned_by(edge_alias: &Alias, data_hex: &str, dataset_hex: &str) -> Condition {
     Condition::all()
-        .add(edge::Column::DataId.eq(uuid_hex::to_hex(Uuid::nil())))
-        .add(edge::Column::DatasetId.eq(dataset_hex))
+        .add(
+            Expr::col((edge_alias.clone(), edge::Column::DataId)).eq(uuid_hex::to_hex(Uuid::nil())),
+        )
+        .add(Expr::col((edge_alias.clone(), edge::Column::DatasetId)).eq(dataset_hex))
         .add(
             Condition::any()
                 .add(endpoint_exclusive_to(
                     edge::Column::SourceNodeId,
+                    edge_alias,
                     data_hex,
                     dataset_hex,
                 ))
                 .add(endpoint_exclusive_to(
                     edge::Column::DestinationNodeId,
+                    edge_alias,
                     data_hex,
                     dataset_hex,
                 )),
         )
+}
+
+/// The structural rows owned by any `(dataset_hex, data_hex)` pair in
+/// `pairs` — rows that die when one of the pairs' cleanups runs even though
+/// their `data_id` column does not name the pair. A delete's claim checks
+/// must not treat them as surviving claims: they leave the ledger with this
+/// request exactly like the rows `in_delete_scope` names.
+///
+/// Callers must skip the predicate when `pairs` is empty (an empty
+/// [`Condition::any`] is not a useful false).
+fn structural_owned_by_scope_pairs(edge_alias: &Alias, pairs: &[(String, String)]) -> Condition {
+    let mut cond = Condition::any();
+    for (dataset_hex, data_hex) in pairs {
+        cond = cond.add(structural_edges_owned_by(edge_alias, data_hex, dataset_hex));
+    }
+    cond
 }
 
 /// Whether an edge row still stands for a graph edge that may exist, and so
@@ -1402,13 +1473,21 @@ fn structural_edges_owned_by(data_hex: &str, dataset_hex: &str) -> Condition {
 /// still in the graph always has at least that claimed endpoint. Asking for
 /// both endpoints would be stronger but unsafe: a document written before
 /// documents got node rows would orphan every `is_part_of` row pointing at it.
-fn edge_row_is_live_claim() -> Condition {
+fn edge_row_is_live_claim(edge_alias: &Alias) -> Condition {
     Condition::any()
-        .add(edge::Column::DataId.ne(uuid_hex::to_hex(Uuid::nil())))
-        .add(endpoint_claimed(edge::Column::SourceNodeId, |_| Vec::new()))
-        .add(endpoint_claimed(edge::Column::DestinationNodeId, |_| {
-            Vec::new()
-        }))
+        .add(
+            Expr::col((edge_alias.clone(), edge::Column::DataId)).ne(uuid_hex::to_hex(Uuid::nil())),
+        )
+        .add(endpoint_claimed(
+            edge::Column::SourceNodeId,
+            edge_alias,
+            |_| Vec::new(),
+        ))
+        .add(endpoint_claimed(
+            edge::Column::DestinationNodeId,
+            edge_alias,
+            |_| Vec::new(),
+        ))
 }
 
 /// The nil-`data_id` structural edge rows that belong to `(data_id, dataset_id)`
@@ -1431,6 +1510,7 @@ pub async fn get_structural_edges_for_data(
     Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
     let rows: Vec<GraphEdge> = edge::Entity::find()
         .filter(structural_edges_owned_by(
+            &Alias::new("edges"),
             &uuid_hex::to_hex(data_id),
             &uuid_hex::to_hex(dataset_id),
         ))
@@ -1532,21 +1612,34 @@ pub async fn get_edge_retrieval_texts_claimed_outside_data(
     db: &DatabaseConnection,
     data_id: Uuid,
     dataset_id: Uuid,
+    dying_pairs: &[(Uuid, Uuid)],
     candidates: &[String],
 ) -> Result<Vec<String>, DatabaseError> {
     Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
     let data_hex = uuid_hex::to_hex(data_id);
     let dataset_hex = uuid_hex::to_hex(dataset_id);
+    let pair_hexes: Vec<(String, String)> = dying_pairs
+        .iter()
+        .map(|(d, x)| (uuid_hex::to_hex(*d), uuid_hex::to_hex(*x)))
+        .collect();
     let wanted: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+    let e = Alias::new("edges");
     let surviving = || {
-        Condition::all()
+        let mut cond = Condition::all()
             .add(
                 Condition::any()
-                    .add(edge::Column::DataId.ne(&data_hex))
-                    .add(edge::Column::DatasetId.ne(&dataset_hex)),
+                    .add(Expr::col((e.clone(), edge::Column::DataId)).ne(&data_hex))
+                    .add(Expr::col((e.clone(), edge::Column::DatasetId)).ne(&dataset_hex)),
             )
-            .add(structural_edges_owned_by(&data_hex, &dataset_hex).not())
-            .add(edge_row_is_live_claim())
+            .add(edge_row_is_live_claim(&e));
+        if !pair_hexes.is_empty() {
+            // Structural rows owned by a scope pair die with this request —
+            // they are not surviving claims (see
+            // [`structural_owned_by_scope_pairs`]). The pair's own rows are
+            // covered because the pair itself is in `dying_pairs`.
+            cond = cond.add(structural_owned_by_scope_pairs(&e, &pair_hexes).not());
+        }
+        cond
     };
 
     let mut claimed = BTreeSet::new();

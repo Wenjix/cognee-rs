@@ -767,3 +767,213 @@ async fn preview_counts_a_slug_deleted_once_across_a_multi_dataset_request() {
         "S goes once, not twice or zero"
     );
 }
+
+/// (d) Structural edges: `is_part_of` rows carry a nil `data_id`, so no
+/// pair-scoped provenance count can see them — yet they die with the pair
+/// whose endpoints are exclusive to it. Preview must count the row and its
+/// `EdgeType` point, and execution must actually remove both.
+#[tokio::test]
+async fn structural_edges_die_with_their_pair_and_preview_counts_them() {
+    let seed = seed().await;
+    let a = seed.dataset("a").await;
+    let xa = seed.item(a).await;
+
+    let graph = Arc::new(MockGraphDB::new());
+    let vector = Arc::new(MockVectorDB::new());
+    let (chunk, doc) = (Uuid::new_v4(), Uuid::new_v4());
+    graph
+        .add_nodes_raw(vec![node(chunk, "TextChunk"), node(doc, "Document")])
+        .await
+        .unwrap();
+    point_to(&vector, "TextChunk", "name", chunk).await;
+    point_to(&vector, "Document", "name", doc).await;
+    let et = EdgeType::deterministic_id("is_part_of");
+    point_to(&vector, "EdgeType", "relationship_name", et).await;
+    graph_storage::upsert_nodes(
+        &seed.db,
+        &[
+            seed.node_row(a, xa, chunk, "TextChunk"),
+            seed.node_row(a, xa, doc, "Document"),
+        ],
+    )
+    .await
+    .unwrap();
+    // The structural row: nil `data_id`, both endpoints exclusive to (A,Xa).
+    graph_storage::upsert_edges(
+        &seed.db,
+        &[seed.edge_row(a, Uuid::nil(), Uuid::new_v4(), chunk, doc, "is_part_of")],
+    )
+    .await
+    .unwrap();
+
+    let svc = shared_service(&seed, graph, vector.clone());
+    let request = DeleteRequest {
+        scope: DeleteScope::DataInDataset {
+            dataset_id: a,
+            data_id: xa,
+            delete_dataset_if_empty: false,
+        },
+        mode: DeleteMode::Soft,
+        memory_only: false,
+    };
+    let preview = svc.preview(&request).await.unwrap();
+    let result = svc.execute(&request).await.unwrap();
+
+    assert_eq!(
+        (
+            preview.graph_nodes_to_delete,
+            preview.vector_points_to_delete,
+            preview.provenance_nodes_to_delete,
+            preview.provenance_edges_to_delete
+        ),
+        (
+            result.deleted_graph_nodes,
+            result.deleted_vector_points,
+            result.deleted_provenance_nodes,
+            result.deleted_provenance_edges
+        ),
+        "preview must count exactly what execute deletes"
+    );
+    assert_eq!(
+        result.deleted_provenance_edges, 1,
+        "the nil-data_id row dies with the pair"
+    );
+    assert_eq!(
+        result.deleted_vector_points, 3,
+        "two node points and the is_part_of EdgeType point"
+    );
+    assert!(
+        !Seed::point(&vector, "EdgeType", "relationship_name", et).await,
+        "the structural EdgeType point is gone"
+    );
+}
+
+/// (e) Two datasets deleted in one request claim one slug with different
+/// `indexed_fields`: A's row indexes `name` and `extra`, B's only `name`.
+/// The slug dies with the second cleanup — but its artifacts are the union
+/// every dying row named, so both points go and preview counts both.
+#[tokio::test]
+async fn a_dying_slug_takes_the_union_of_its_rows_indexed_fields() {
+    let seed = seed().await;
+    let a = seed.dataset("a").await;
+    let b = seed.dataset("b").await;
+    let xa = seed.item(a).await;
+    let xb = seed.item(b).await;
+
+    let graph = Arc::new(MockGraphDB::new());
+    let vector = Arc::new(MockVectorDB::new());
+    let s = Uuid::new_v4();
+    graph.add_nodes_raw(vec![node(s, "Entity")]).await.unwrap();
+    point_to(&vector, "Entity", "name", s).await;
+    point_to(&vector, "Entity", "extra", s).await;
+    graph_storage::upsert_nodes(
+        &seed.db,
+        &[
+            GraphNode {
+                indexed_fields: json!(["name", "extra"]),
+                ..seed.node_row(a, xa, s, "Entity")
+            },
+            GraphNode {
+                indexed_fields: json!(["name"]),
+                ..seed.node_row(b, xb, s, "Entity")
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let svc = shared_service(&seed, graph, vector.clone());
+    let preview = svc.preview_datasets_by_id(&[a, b]).await.unwrap();
+    let result = svc
+        .execute_datasets_by_id(&[a, b], DeleteMode::Soft, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            preview.graph_nodes_to_delete,
+            preview.vector_points_to_delete,
+            preview.provenance_nodes_to_delete,
+            preview.provenance_edges_to_delete
+        ),
+        (
+            result.deleted_graph_nodes,
+            result.deleted_vector_points,
+            result.deleted_provenance_nodes,
+            result.deleted_provenance_edges
+        ),
+        "preview must count exactly what execute deletes"
+    );
+    assert_eq!(
+        result.deleted_vector_points, 2,
+        "the union of indexed fields, not the last row's"
+    );
+    assert!(
+        !Seed::point(&vector, "Entity", "extra", s).await,
+        "the field only the earlier row indexed is gone too"
+    );
+}
+
+/// (f) Two datasets deleted together hold edges with different slugs but
+/// the same retrieval text — one `EdgeType` point. Each row is unique to
+/// its dataset: the point goes exactly once, and preview counts once.
+#[tokio::test]
+async fn a_retrieval_text_shared_across_dying_slugs_goes_once() {
+    let seed = seed().await;
+    let a = seed.dataset("a").await;
+    let b = seed.dataset("b").await;
+    let xa = seed.item(a).await;
+    let xb = seed.item(b).await;
+
+    let graph = Arc::new(MockGraphDB::new());
+    let vector = Arc::new(MockVectorDB::new());
+    let (n1, n2) = (Uuid::new_v4(), Uuid::new_v4());
+    let et = EdgeType::deterministic_id("is_a");
+    point_to(&vector, "EdgeType", "relationship_name", et).await;
+    for (src, dst) in [(n1, n2), (n2, n1)] {
+        let t = Triplet::new(src, dst, "is_a".to_string(), String::new()).id;
+        point_to(&vector, "Triplet", "text", t).await;
+    }
+    // Different edge slugs, same retrieval text → one EdgeType point.
+    graph_storage::upsert_edges(
+        &seed.db,
+        &[
+            seed.edge_row(a, xa, Uuid::new_v4(), n1, n2, "is_a"),
+            seed.edge_row(b, xb, Uuid::new_v4(), n2, n1, "is_a"),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let svc = shared_service(&seed, graph, vector.clone());
+    let preview = svc.preview_datasets_by_id(&[a, b]).await.unwrap();
+    let result = svc
+        .execute_datasets_by_id(&[a, b], DeleteMode::Soft, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            preview.graph_nodes_to_delete,
+            preview.vector_points_to_delete,
+            preview.provenance_nodes_to_delete,
+            preview.provenance_edges_to_delete
+        ),
+        (
+            result.deleted_graph_nodes,
+            result.deleted_vector_points,
+            result.deleted_provenance_nodes,
+            result.deleted_provenance_edges
+        ),
+        "preview must count exactly what execute deletes"
+    );
+    assert_eq!(
+        result.deleted_vector_points, 3,
+        "two triplets and the shared EdgeType point once"
+    );
+    assert!(
+        !Seed::point(&vector, "EdgeType", "relationship_name", et).await,
+        "a text whose claims all died is gone — a surviving row in a dying \
+         pair is not a claim"
+    );
+}

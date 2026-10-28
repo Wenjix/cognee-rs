@@ -123,9 +123,15 @@ impl<'a> Fixture<'a> {
 
     async fn claimed_outside_a(&self, candidates: &[&str]) -> Vec<String> {
         let candidates: Vec<String> = candidates.iter().map(|text| text.to_string()).collect();
-        get_edge_retrieval_texts_claimed_outside_data(self.db, self.a, self.dataset, &candidates)
-            .await
-            .expect("claimed texts")
+        get_edge_retrieval_texts_claimed_outside_data(
+            self.db,
+            self.a,
+            self.dataset,
+            &[(self.dataset, self.a)],
+            &candidates,
+        )
+        .await
+        .expect("claimed texts")
     }
 }
 
@@ -333,9 +339,15 @@ async fn candidates_are_batched(db: &DatabaseConnection) {
         )
         .await;
     }
-    let claimed = get_edge_retrieval_texts_claimed_outside_data(f.db, f.a, f.dataset, &candidates)
-        .await
-        .expect("claimed texts");
+    let claimed = get_edge_retrieval_texts_claimed_outside_data(
+        f.db,
+        f.a,
+        f.dataset,
+        &[(f.dataset, f.a)],
+        &candidates,
+    )
+    .await
+    .expect("claimed texts");
     assert_eq!(claimed, vec!["text 0003", "text 0260", "text 0699"]);
 }
 

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     DeleteError, delete_graph_artifacts, delete_vector_artifacts, edge_retrieval_text,
-    edge_type_vector_id,
+    edge_type_vector_id, parse_indexed_fields, triplet_vector_id,
 };
 
 /// Which ownership rows a single sweep is responsible for.
@@ -247,8 +247,22 @@ impl RunSweeper {
         outcome.graph_nodes_deleted = graph_nodes;
         outcome.warnings.extend(graph_warnings);
 
-        let (vector_points, vector_warnings) =
-            delete_vector_artifacts(Some(&self.vector_db), &nodes, &edges, &edge_type_ids).await?;
+        let node_points: Vec<(Uuid, String, String)> = nodes
+            .iter()
+            .flat_map(|n| {
+                parse_indexed_fields(&n.indexed_fields)
+                    .into_iter()
+                    .map(|field| (n.slug, n.node_type.clone(), field))
+            })
+            .collect();
+        let triplet_ids: Vec<Uuid> = edges.iter().map(triplet_vector_id).collect();
+        let (vector_points, vector_warnings) = delete_vector_artifacts(
+            Some(&self.vector_db),
+            &node_points,
+            &triplet_ids,
+            &edge_type_ids,
+        )
+        .await?;
         outcome.vector_points_deleted = vector_points;
         outcome.warnings.extend(vector_warnings);
 

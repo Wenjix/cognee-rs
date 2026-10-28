@@ -145,10 +145,13 @@ pub trait DeleteDb: Send + Sync {
 
     /// The subset of `candidates` (`EdgeType` retrieval texts) still claimed
     /// by edge rows that survive the deletion of `(data_id, dataset_id)`.
+    /// `dying_pairs` lists every `(dataset_id, data_id)` pair whose rows die
+    /// in this request — structural rows they own are not surviving claims.
     async fn get_edge_retrieval_texts_claimed_outside_data(
         &self,
         data_id: Uuid,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
         candidates: &[String],
     ) -> Result<Vec<String>, DatabaseError>;
 
@@ -159,10 +162,13 @@ pub trait DeleteDb: Send + Sync {
         dataset_id: Uuid,
     ) -> Result<Vec<GraphNode>, DatabaseError>;
 
-    /// Edge rows of `dataset_id` whose slug no row of another dataset claims.
+    /// Edge rows of `dataset_id` whose slug no surviving row claims — a
+    /// claim is a live row outside the dataset that does not die with this
+    /// request (`dying_pairs` names every pair the request removes).
     async fn get_edges_unique_to_dataset(
         &self,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
     ) -> Result<Vec<GraphEdge>, DatabaseError>;
 
     /// Node rows of `(data_id, dataset_id)` whose slug no row outside that
@@ -173,19 +179,22 @@ pub trait DeleteDb: Send + Sync {
         dataset_id: Uuid,
     ) -> Result<Vec<GraphNode>, DatabaseError>;
 
-    /// Edge rows of `(data_id, dataset_id)` whose slug no row outside that
-    /// pair claims.
+    /// Edge rows of `(data_id, dataset_id)` whose slug no surviving row
+    /// claims — `dying_pairs` as in [`Self::get_edges_unique_to_dataset`].
     async fn get_edges_unique_to_data_in_store(
         &self,
         data_id: Uuid,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
     ) -> Result<Vec<GraphEdge>, DatabaseError>;
 
     /// The subset of `candidates` (`EdgeType` retrieval texts) still claimed
     /// by edge rows that survive the deletion of `dataset_id`.
+    /// `dying_pairs` as in [`Self::get_edges_unique_to_dataset`].
     async fn get_edge_retrieval_texts_claimed_outside_dataset(
         &self,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
         candidates: &[String],
     ) -> Result<Vec<String>, DatabaseError>;
 
@@ -422,10 +431,15 @@ impl DeleteDb for DatabaseConnection {
         &self,
         data_id: Uuid,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
         candidates: &[String],
     ) -> Result<Vec<String>, DatabaseError> {
         graph_storage::get_edge_retrieval_texts_claimed_outside_data(
-            self, data_id, dataset_id, candidates,
+            self,
+            data_id,
+            dataset_id,
+            dying_pairs,
+            candidates,
         )
         .await
     }
@@ -440,8 +454,9 @@ impl DeleteDb for DatabaseConnection {
     async fn get_edges_unique_to_dataset(
         &self,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
     ) -> Result<Vec<GraphEdge>, DatabaseError> {
-        graph_storage::get_edges_unique_to_dataset(self, dataset_id).await
+        graph_storage::get_edges_unique_to_dataset(self, dataset_id, dying_pairs).await
     }
 
     async fn get_nodes_unique_to_data_in_store(
@@ -456,17 +471,23 @@ impl DeleteDb for DatabaseConnection {
         &self,
         data_id: Uuid,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
     ) -> Result<Vec<GraphEdge>, DatabaseError> {
-        graph_storage::get_edges_unique_to_data_in_store(self, data_id, dataset_id).await
+        graph_storage::get_edges_unique_to_data_in_store(self, data_id, dataset_id, dying_pairs)
+            .await
     }
 
     async fn get_edge_retrieval_texts_claimed_outside_dataset(
         &self,
         dataset_id: Uuid,
+        dying_pairs: &[(Uuid, Uuid)],
         candidates: &[String],
     ) -> Result<Vec<String>, DatabaseError> {
         graph_storage::get_edge_retrieval_texts_claimed_outside_dataset(
-            self, dataset_id, candidates,
+            self,
+            dataset_id,
+            dying_pairs,
+            candidates,
         )
         .await
     }
