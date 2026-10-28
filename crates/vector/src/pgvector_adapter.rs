@@ -1373,20 +1373,31 @@ async fn migrate(db: &DatabaseConnection) -> VectorDBResult<()> {
 }
 
 /// Whether the connection's own schema is not `public` (see
-/// `PgVectorAdapter::schema_pinned`). Every pooled connection is opened with
+/// `PgVectorAdapter::own_schema`). Every pooled connection is opened with
 /// the same options, so one probe answers for the pool.
-async fn schema_pinned(db: &DatabaseConnection) -> VectorDBResult<bool> {
+async fn own_schema(db: &DatabaseConnection) -> VectorDBResult<Option<String>> {
     let row = db
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
-            "SELECT current_schema() IS DISTINCT FROM 'public' AS pinned",
+            "SELECT current_schema() AS schema",
         ))
         .await
         .map_err(|e| VectorDBError::StorageError(format!("PGVector schema probe failed: {e}")))?;
-    row.map_or(Ok(false), |row| {
-        row.try_get::<bool>("", "pinned")
+    row.map_or(Ok(None), |row| {
+        row.try_get::<Option<String>>("", "schema")
+            .map(|s| s.filter(|s| s != "public"))
             .map_err(|e| VectorDBError::StorageError(format!("PGVector schema probe failed: {e}")))
     })
+}
+
+/// `name` as a quoted identifier, schema-qualified when `schema` is `Some`:
+/// the shared helper for the DDL builders, which do not have `self` (see
+/// [`PgVectorAdapter::qualified`]).
+fn qualified_name(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(schema) => format!("\"{schema}\".\"{name}\""),
+        None => format!("\"{name}\""),
+    }
 }
 
 /// Vector database backed by PostgreSQL + pgvector extension.
@@ -1448,10 +1459,10 @@ pub struct PgVectorAdapter {
     /// means "checked", not "warned", so the two catalog probes happen at most
     /// once per collection per process.
     legacy_checked: RwLock<HashSet<String>>,
-    /// Whether this adapter's own schema (`current_schema()`, where its
-    /// migrations put its tables) is not `public` — a per-dataset schema of
-    /// the shared-database mode, pinned with `search_path = ds_…, public`
-    /// (`docs/design/per-dataset-storage.md`).
+    /// This adapter's own schema name (`current_schema()`, where its
+    /// migrations put its tables) when it is not `public` — a per-dataset
+    /// schema of the shared-database mode, pinned with `search_path = ds_…,
+    /// public` (`docs/design/per-dataset-storage.md`). `None` on `public`.
     ///
     /// `public` has to stay on that path, because the `vector` extension's
     /// types and operators live there; but then an unqualified collection
@@ -1459,9 +1470,12 @@ pub struct PgVectorAdapter {
     /// name, which in a database that once held the shared store is every
     /// dataset's data. So a pinned adapter treats a collection that is not in
     /// its own `_vector_collections` as missing before it touches the table
-    /// (see [`Self::in_own_schema`]). An adapter on `public` keeps the plain
-    /// single-statement paths.
-    schema_pinned: bool,
+    /// (see [`Self::in_own_schema`]), and qualifies every table reference with
+    /// the schema name (see [`Self::qualified`]): a schema — or just the
+    /// table — that disappears behind its back produces an error, never a
+    /// read or write against `public` (M38). An adapter on `public` keeps the
+    /// plain single-statement paths: it emits exactly the SQL it always has.
+    own_schema: Option<String>,
 }
 
 /// Open bulk-load scopes, and per collection the points written in them and
@@ -1575,7 +1589,7 @@ impl PgVectorAdapter {
             .map_err(|e| VectorDBError::StorageError(format!("PGVector connect failed: {e}")))?;
 
         migrate(&db).await?;
-        let schema_pinned = schema_pinned(&db).await?;
+        let own_schema = own_schema(&db).await?;
 
         debug!("PgVectorAdapter initialised (dimension={dimension})");
         let features = probe_pgvector_features(&db).await;
@@ -1590,7 +1604,7 @@ impl PgVectorAdapter {
             halfvec: features.halfvec,
             iterative_scan: features.iterative_scan,
             legacy_checked: RwLock::new(HashSet::new()),
-            schema_pinned,
+            own_schema,
         })
     }
 
@@ -1608,7 +1622,7 @@ impl PgVectorAdapter {
     /// search for the privilege.
     pub async fn from_connection(db: DatabaseConnection, dimension: usize) -> VectorDBResult<Self> {
         migrate(&db).await?;
-        let schema_pinned = schema_pinned(&db).await?;
+        let own_schema = own_schema(&db).await?;
 
         let features = probe_pgvector_features(&db).await;
         Ok(Self {
@@ -1622,7 +1636,7 @@ impl PgVectorAdapter {
             halfvec: features.halfvec,
             iterative_scan: features.iterative_scan,
             legacy_checked: RwLock::new(HashSet::new()),
-            schema_pinned,
+            own_schema,
         })
     }
 
@@ -1783,7 +1797,7 @@ impl PgVectorAdapter {
         for coll in colls {
             if let Err(e) = self
                 .db
-                .execute_unprepared(&format!(r#"ANALYZE "{coll}""#))
+                .execute_unprepared(&format!(r#"ANALYZE {}"#, self.qualified(&coll)))
                 .await
                 .map_err(|e| VectorDBError::StorageError(e.to_string()))
             {
@@ -1815,7 +1829,7 @@ impl PgVectorAdapter {
                     .db
                     .query_one(Statement::from_string(
                         DatabaseBackend::Postgres,
-                        format!(r#"SELECT count(*) AS n FROM "{coll}""#),
+                        format!(r#"SELECT count(*) AS n FROM {}"#, self.qualified(&coll)),
                     ))
                     .await
                     .map_err(storage)?
@@ -1833,6 +1847,7 @@ impl PgVectorAdapter {
                 txn.execute_unprepared(&Self::vector_index_ddl(
                     &self.tuning,
                     &coll,
+                    self.own_schema.as_deref(),
                     dimension,
                     false,
                     self.halfvec,
@@ -1955,7 +1970,7 @@ impl PgVectorAdapter {
             .db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
-                format!(r#"SELECT count(*) AS n FROM "{coll}""#),
+                format!(r#"SELECT count(*) AS n FROM {}"#, self.qualified(coll)),
             ))
             .await
             .map_err(|e| VectorDBError::StorageError(e.to_string()))?
@@ -2061,6 +2076,38 @@ impl PgVectorAdapter {
             .remove(coll);
     }
 
+    /// `name` as a schema-qualified quoted identifier (`"ds_…"."name"`) when
+    /// this adapter is pinned to its own schema, else `"name"` — the exact
+    /// SQL an unpinned adapter emits today. Qualifying is what keeps a bare
+    /// name from resolving to `public`'s same-named table once the schema,
+    /// or just the table, disappears behind this adapter's back (M38). The
+    /// schema name is trustworthy for a quoted identifier: it came from
+    /// `current_schema()` on the adapter's own connection.
+    fn qualified(&self, name: &str) -> String {
+        match &self.own_schema {
+            Some(schema) => format!("\"{schema}\".\"{name}\""),
+            None => format!("\"{name}\""),
+        }
+    }
+
+    /// [`Self::qualified`] for a sea-query table reference.
+    fn table_ref(&self, name: &str) -> sea_orm::sea_query::TableRef {
+        use sea_orm::sea_query::IntoTableRef;
+        match &self.own_schema {
+            Some(schema) => (Alias::new(schema), Alias::new(name)).into_table_ref(),
+            None => Alias::new(name).into_table_ref(),
+        }
+    }
+
+    /// [`Self::table_ref`] for the `_vector_collections` bookkeeping table.
+    fn vcoll_ref(&self) -> sea_orm::sea_query::TableRef {
+        use sea_orm::sea_query::IntoTableRef;
+        match &self.own_schema {
+            Some(schema) => (Alias::new(schema), VColl::Table).into_table_ref(),
+            None => VColl::Table.into_table_ref(),
+        }
+    }
+
     /// Warn once per collection per process if `coll` still carries only the
     /// legacy full-precision `<coll>_vector_hnsw` index, with no valid
     /// `<coll>_halfvec_hnsw` — the state every store upgraded from before the
@@ -2133,7 +2180,7 @@ impl PgVectorAdapter {
 
     /// Whether `coll` may be touched by its bare name: always on `public`; on a
     /// pinned schema only when it is this schema's own collection (see
-    /// [`Self::schema_pinned`]). A cache hit costs nothing; a miss is the
+    /// [`Self::own_schema`]). A cache hit costs nothing; a miss is the
     /// `has_collection` round trip the retrievers and the indexer already make.
     async fn in_own_schema(
         &self,
@@ -2141,7 +2188,7 @@ impl PgVectorAdapter {
         field_name: &str,
         coll: &str,
     ) -> VectorDBResult<bool> {
-        if !self.schema_pinned || self.is_known(coll) {
+        if self.own_schema.is_none() || self.is_known(coll) {
             return Ok(true);
         }
         self.has_collection(data_type, field_name).await
@@ -2596,7 +2643,7 @@ impl PgVectorAdapter {
         // for why it is not a bind parameter), so it carries no injection risk.
         let limit = i64::try_from(top_k).unwrap_or(i64::MAX);
         let scored =
-            format!(r#"SELECT id, 1 - (vector <=> {query}) AS score, metadata FROM "{coll}""#);
+            format!(r#"SELECT id, 1 - (vector <=> {query}) AS score, metadata FROM {coll}"#);
         if !guard_short {
             return format!(
                 "SELECT id, score, metadata, false AS exact_fallback FROM \
@@ -2671,6 +2718,7 @@ impl PgVectorAdapter {
         db: &DatabaseConnection,
         tuning: &PgVectorTuning,
         coll: &str,
+        schema: Option<&str>,
         dimension: usize,
         concurrently: bool,
         halfvec: bool,
@@ -2684,7 +2732,7 @@ impl PgVectorAdapter {
         }
 
         let index = Self::vector_index_name(coll, halfvec);
-        let ddl = Self::vector_index_ddl(tuning, coll, dimension, concurrently, halfvec);
+        let ddl = Self::vector_index_ddl(tuning, coll, schema, dimension, concurrently, halfvec);
 
         db.execute_unprepared(&ddl)
             .await
@@ -2705,12 +2753,13 @@ impl PgVectorAdapter {
     }
 
     /// `CREATE INDEX` for `coll`'s NodeSet-membership GIN index.
-    fn set_names_index_ddl(coll: &str, concurrently: bool) -> String {
+    fn set_names_index_ddl(coll: &str, schema: Option<&str>, concurrently: bool) -> String {
         let index = Self::set_names_index_name(coll);
+        let table = qualified_name(schema, coll);
         let concurrent_kw = if concurrently { " CONCURRENTLY" } else { "" };
         format!(
             r#"CREATE INDEX{concurrent_kw} IF NOT EXISTS "{index}"
-               ON "{coll}" USING gin (cognee_vector_set_names(metadata))"#
+               ON {table} USING gin (cognee_vector_set_names(metadata))"#
         )
     }
 
@@ -2731,11 +2780,13 @@ impl PgVectorAdapter {
     fn vector_index_ddl(
         tuning: &PgVectorTuning,
         coll: &str,
+        schema: Option<&str>,
         dimension: usize,
         concurrently: bool,
         halfvec: bool,
     ) -> String {
         let index = Self::vector_index_name(coll, halfvec);
+        let table = qualified_name(schema, coll);
         let concurrent_kw = if concurrently { " CONCURRENTLY" } else { "" };
         // Without `halfvec` (pgvector < 0.7) the half-precision cast does not
         // even parse, so the index goes over the column itself with
@@ -2748,7 +2799,7 @@ impl PgVectorAdapter {
         };
         format!(
             r#"CREATE INDEX{concurrent_kw} IF NOT EXISTS "{index}"
-               ON "{coll}" USING hnsw ({column})
+               ON {table} USING hnsw ({column})
                WITH (m = {m}, ef_construction = {ef})"#,
             m = tuning.hnsw_m,
             ef = tuning.hnsw_ef_construction,
@@ -2835,7 +2886,7 @@ impl PgVectorAdapter {
     pub async fn create_missing_vector_indexes(&self) -> VectorDBResult<VectorIndexBackfill> {
         let query = Query::select()
             .columns([VColl::CollectionName, VColl::Dimension])
-            .from(VColl::Table)
+            .from(self.vcoll_ref())
             .to_owned();
 
         let rows = self
@@ -2911,7 +2962,10 @@ impl PgVectorAdapter {
                 debug!("dropping invalid index {index} left by a failed build, rebuilding");
                 if let Err(e) = self
                     .db
-                    .execute_unprepared(&format!(r#"DROP INDEX CONCURRENTLY "{index}""#))
+                    .execute_unprepared(&format!(
+                        r#"DROP INDEX CONCURRENTLY {}"#,
+                        self.qualified(&index)
+                    ))
                     .await
                 {
                     warn!("could not drop invalid index {index}, skipping {coll}: {e}");
@@ -2924,6 +2978,7 @@ impl PgVectorAdapter {
                 &self.db,
                 &self.tuning,
                 &coll,
+                self.own_schema.as_deref(),
                 dimension.max(0) as usize,
                 true,
                 self.halfvec,
@@ -3020,7 +3075,10 @@ impl PgVectorAdapter {
         }
         match self
             .db
-            .execute_unprepared(&format!(r#"DROP INDEX CONCURRENTLY IF EXISTS "{legacy}""#))
+            .execute_unprepared(&format!(
+                r#"DROP INDEX CONCURRENTLY IF EXISTS {}"#,
+                self.qualified(&legacy)
+            ))
             .await
         {
             Ok(_) => {
@@ -3053,7 +3111,10 @@ impl PgVectorAdapter {
         if state == Some(false)
             && let Err(e) = self
                 .db
-                .execute_unprepared(&format!(r#"DROP INDEX CONCURRENTLY "{index}""#))
+                .execute_unprepared(&format!(
+                    r#"DROP INDEX CONCURRENTLY {}"#,
+                    self.qualified(&index)
+                ))
                 .await
         {
             warn!("could not drop invalid index {index}, skipping it: {e}");
@@ -3062,7 +3123,11 @@ impl PgVectorAdapter {
         }
         match self
             .db
-            .execute_unprepared(&Self::set_names_index_ddl(coll, true))
+            .execute_unprepared(&Self::set_names_index_ddl(
+                coll,
+                self.own_schema.as_deref(),
+                true,
+            ))
             .await
         {
             Ok(_) => report.built += 1,
@@ -3148,7 +3213,10 @@ impl PgVectorAdapter {
                 }
                 if reached == Some(BulkDefer::Yes) {
                     self.db
-                        .execute_unprepared(&format!(r#"DROP INDEX IF EXISTS "{index}""#))
+                        .execute_unprepared(&format!(
+                            r#"DROP INDEX IF EXISTS {}"#,
+                            self.qualified(&index)
+                        ))
                         .await
                         .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
                     debug!("bulk load: dropped HNSW index on {coll} until the load ends");
@@ -3171,7 +3239,14 @@ impl PgVectorAdapter {
                 .write_points_concurrently(coll, points, merge_membership)
                 .await;
         }
-        Self::write_points(&self.db, coll, points, merge_membership).await
+        Self::write_points(
+            &self.db,
+            coll,
+            self.own_schema.as_deref(),
+            points,
+            merge_membership,
+        )
+        .await
     }
 
     /// [`Self::write_points`] for a large batch into an HNSW-indexed
@@ -3196,13 +3271,14 @@ impl PgVectorAdapter {
     ) -> VectorDBResult<()> {
         let storage = |e: sea_orm::DbErr| VectorDBError::StorageError(e.to_string());
         let ids: Vec<Uuid> = points.iter().map(|p| p.id).collect();
+        let q = self.qualified(coll);
         let row = self
             .db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 format!(
-                    r#"SELECT (SELECT count(*) FROM "{coll}") AS total,
-                              (SELECT count(*) FROM "{coll}" WHERE id = ANY($1::uuid[])) AS present"#
+                    r#"SELECT (SELECT count(*) FROM {q}) AS total,
+                              (SELECT count(*) FROM {q} WHERE id = ANY($1::uuid[])) AS present"#
                 ),
                 [ids.into()],
             ))
@@ -3230,10 +3306,17 @@ impl PgVectorAdapter {
         let rows_after = total.saturating_add(incoming.saturating_sub(present));
         let dimension = points.first().map_or(0, |p| p.vector.len());
         let txn = self.db.begin().await.map_err(storage)?;
-        txn.execute_unprepared(&format!(r#"DROP INDEX "{index}""#))
+        txn.execute_unprepared(&format!(r#"DROP INDEX {}"#, self.qualified(index)))
             .await
             .map_err(storage)?;
-        Self::write_points(&txn, coll, points, merge_membership).await?;
+        Self::write_points(
+            &txn,
+            coll,
+            self.own_schema.as_deref(),
+            points,
+            merge_membership,
+        )
+        .await?;
         txn.execute_unprepared(&format!(
             "SET LOCAL maintenance_work_mem = '{}kB'; \
              SET LOCAL max_parallel_maintenance_workers = {}",
@@ -3245,6 +3328,7 @@ impl PgVectorAdapter {
         txn.execute_unprepared(&Self::vector_index_ddl(
             &self.tuning,
             coll,
+            self.own_schema.as_deref(),
             dimension,
             false,
             self.halfvec,
@@ -3276,10 +3360,16 @@ impl PgVectorAdapter {
     async fn write_points<C: ConnectionTrait>(
         conn: &C,
         coll: &str,
+        schema: Option<&str>,
         points: &[VectorPoint],
         merge_membership: bool,
     ) -> VectorDBResult<()> {
-        for stmt in Self::upsert_statements(coll, points, merge_membership, WRITE_BATCH) {
+        for stmt in Self::upsert_statements(
+            &qualified_name(schema, coll),
+            points,
+            merge_membership,
+            WRITE_BATCH,
+        ) {
             conn.execute(stmt)
                 .await
                 .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
@@ -3308,7 +3398,7 @@ impl PgVectorAdapter {
         use futures_util::StreamExt;
         let per_writer = points.len().div_ceil(HNSW_INSERT_WRITERS);
         let batch = per_writer.clamp(HNSW_INSERT_MIN_BATCH, WRITE_BATCH);
-        let stmts = Self::upsert_statements(coll, points, merge_membership, batch);
+        let stmts = Self::upsert_statements(&self.qualified(coll), points, merge_membership, batch);
         if stmts.len() <= 1 {
             for stmt in stmts {
                 self.db
@@ -3351,7 +3441,7 @@ impl PgVectorAdapter {
         );
         let mut stmts = Vec::with_capacity(points.len().div_ceil(batch.max(1)));
         for chunk in points.chunks(batch.max(1)) {
-            let mut sql = format!(r#"INSERT INTO "{coll}" AS t (id, vector, metadata) VALUES "#);
+            let mut sql = format!(r#"INSERT INTO {coll} AS t (id, vector, metadata) VALUES "#);
             let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 3);
             for pt in chunk {
                 let pt = pt.clone();
@@ -3574,6 +3664,7 @@ impl VectorDB for PgVectorAdapter {
         dimension: usize,
     ) -> VectorDBResult<()> {
         let coll = Self::collection_name(data_type, field_name)?;
+        let q = self.qualified(&coll);
 
         if self.has_collection(data_type, field_name).await? {
             return Err(VectorDBError::CollectionExists(coll));
@@ -3595,12 +3686,12 @@ impl VectorDB for PgVectorAdapter {
         // out when a row does not. Sent as one simple-query string, so the two
         // statements commit or fail together.
         let ddl = format!(
-            r#"CREATE TABLE "{coll}" (
+            r#"CREATE TABLE {q} (
                 id UUID PRIMARY KEY,
                 vector vector({dimension}),
                 metadata JSONB NOT NULL DEFAULT '{{}}'
             ) WITH (toast_tuple_target = 8160);
-            ALTER TABLE "{coll}" ALTER COLUMN vector SET STORAGE MAIN"#
+            ALTER TABLE {q} ALTER COLUMN vector SET STORAGE MAIN"#
         );
         self.db
             .execute_unprepared(&ddl)
@@ -3626,6 +3717,7 @@ impl VectorDB for PgVectorAdapter {
             &self.db,
             &self.tuning,
             &coll,
+            self.own_schema.as_deref(),
             dimension,
             false,
             self.halfvec,
@@ -3644,7 +3736,11 @@ impl VectorDB for PgVectorAdapter {
         // with or without it, only slower, and the backfill adds it later.
         if let Err(e) = self
             .db
-            .execute_unprepared(&Self::set_names_index_ddl(&coll, false))
+            .execute_unprepared(&Self::set_names_index_ddl(
+                &coll,
+                self.own_schema.as_deref(),
+                false,
+            ))
             .await
         {
             warn!(
@@ -3655,7 +3751,7 @@ impl VectorDB for PgVectorAdapter {
 
         // Register in bookkeeping table.
         let insert = Query::insert()
-            .into_table(VColl::Table)
+            .into_table(self.vcoll_ref())
             .columns([
                 VColl::CollectionName,
                 VColl::DataType,
@@ -3693,7 +3789,7 @@ impl VectorDB for PgVectorAdapter {
 
         let inner = Query::select()
             .expr(Expr::val(1))
-            .from(VColl::Table)
+            .from(self.vcoll_ref())
             .and_where(Expr::col(VColl::CollectionName).eq(coll.clone()))
             .to_owned();
 
@@ -3911,7 +4007,7 @@ impl VectorDB for PgVectorAdapter {
         let indexless = self.is_deferred(&coll);
         let order = Self::candidate_order_expr("$1", dim, top_k, self.halfvec, indexless);
         let candidates = Self::candidate_select_sql(
-            &coll,
+            &self.qualified(&coll),
             "$1::vector",
             &order,
             top_k,
@@ -3976,6 +4072,7 @@ impl VectorDB for PgVectorAdapter {
         };
 
         let coll = Self::collection_name(data_type, field_name)?;
+        let q = self.qualified(&coll);
         Span::current().record(COGNEE_VECTOR_COLLECTION, coll.as_str());
         self.require_own_collection(data_type, field_name, &coll)
             .await?;
@@ -4008,7 +4105,7 @@ impl VectorDB for PgVectorAdapter {
         let limit = i64::try_from(top_k).unwrap_or(i64::MAX);
         let sql = format!(
             r#"SELECT id, 1 - (vector <=> $1::vector) AS score, metadata
-               FROM "{coll}"
+               FROM {q}
                WHERE cognee_vector_set_names(metadata) {predicate} $2::text[]
                ORDER BY (vector <=> $1::vector) + 0, id
                LIMIT {limit}"#
@@ -4059,6 +4156,7 @@ impl VectorDB for PgVectorAdapter {
         ids: &[Uuid],
     ) -> VectorDBResult<Vec<SearchResult>> {
         let coll = Self::collection_name(data_type, field_name)?;
+        let q = self.qualified(&coll);
         if ids.is_empty() {
             return Ok(vec![]);
         }
@@ -4077,7 +4175,7 @@ impl VectorDB for PgVectorAdapter {
         // `IN (…)` list per round trip.
         let mut results = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(ID_BATCH) {
-            let sql = format!(r#"SELECT id, metadata FROM "{coll}" WHERE id = ANY($1::uuid[])"#);
+            let sql = format!(r#"SELECT id, metadata FROM {q} WHERE id = ANY($1::uuid[])"#);
             let values: Vec<sea_orm::Value> = vec![chunk.to_vec().into()];
             let rows = match self
                 .db
@@ -4129,6 +4227,7 @@ impl VectorDB for PgVectorAdapter {
         query_vector: &[f32],
     ) -> VectorDBResult<Option<Vec<SearchResult>>> {
         let coll = Self::collection_name(data_type, field_name)?;
+        let q = self.qualified(&coll);
         if ids.is_empty() {
             return Ok(Some(vec![]));
         }
@@ -4143,7 +4242,7 @@ impl VectorDB for PgVectorAdapter {
         // every requested row is scored exactly in fp32.
         let sql = format!(
             r#"SELECT id, 1 - (vector <=> $1::vector) AS score, metadata
-               FROM "{coll}"
+               FROM {q}
                WHERE id = ANY($2::uuid[])"#
         );
         let vec_str = Self::format_vector(query_vector);
@@ -4224,7 +4323,7 @@ impl VectorDB for PgVectorAdapter {
         // Per query, so one query trapped in a closed corner of the HNSW
         // graph falls back to the exact scan without dragging the others.
         let candidates = Self::candidate_select_sql(
-            &coll,
+            &self.qualified(&coll),
             "q.vec",
             &order,
             top_k,
@@ -4299,29 +4398,38 @@ impl VectorDB for PgVectorAdapter {
         self.forget_bulk(&coll);
         // `DROP TABLE IF EXISTS` by bare name would drop `public`'s table when
         // a pinned schema has none of its own.
-        if self.in_own_schema(data_type, field_name, &coll).await? {
-            let drop = Table::drop()
-                .table(Alias::new(&coll))
-                .if_exists()
+        let result = async {
+            if self.in_own_schema(data_type, field_name, &coll).await? {
+                let drop = Table::drop()
+                    .table(self.table_ref(&coll))
+                    .if_exists()
+                    .to_owned();
+
+                self.db
+                    .execute_unprepared(&drop.to_string(PostgresQueryBuilder))
+                    .await
+                    .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+            }
+
+            let delete = Query::delete()
+                .from_table(self.vcoll_ref())
+                .and_where(Expr::col(VColl::CollectionName).eq(&coll))
                 .to_owned();
 
             self.db
-                .execute_unprepared(&drop.to_string(PostgresQueryBuilder))
+                .execute(self.build(&delete))
                 .await
                 .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+
+            Ok(())
         }
-
-        let delete = Query::delete()
-            .from_table(VColl::Table)
-            .and_where(Expr::col(VColl::CollectionName).eq(&coll))
-            .to_owned();
-
-        self.db
-            .execute(self.build(&delete))
-            .await
-            .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
-
-        Ok(())
+        .await;
+        // The `in_own_schema` probe just re-remembered the collection it
+        // found: evict it again on every exit path, error or not, or a stale
+        // positive entry would short-circuit `create_collection` and leave
+        // later bare-name queries to `public`'s same-named table (M37).
+        self.forget(&coll);
+        result
     }
 
     #[instrument(
@@ -4346,6 +4454,7 @@ impl VectorDB for PgVectorAdapter {
         }
 
         let coll = Self::collection_name(data_type, field_name)?;
+        let q = self.qualified(&coll);
         Span::current().record(COGNEE_VECTOR_COLLECTION, coll.as_str());
         self.require_own_collection(data_type, field_name, &coll)
             .await?;
@@ -4363,7 +4472,7 @@ impl VectorDB for PgVectorAdapter {
             self.db
                 .execute(Statement::from_sql_and_values(
                     DatabaseBackend::Postgres,
-                    format!(r#"DELETE FROM "{coll}" WHERE id = ANY($1::uuid[])"#),
+                    format!(r#"DELETE FROM {q} WHERE id = ANY($1::uuid[])"#),
                     [chunk.to_vec().into()],
                 ))
                 .await
@@ -4389,7 +4498,7 @@ impl VectorDB for PgVectorAdapter {
 
         let query = Query::select()
             .expr_as(Func::count(Expr::col(Asterisk)), Alias::new("count"))
-            .from(Alias::new(&coll))
+            .from(self.table_ref(&coll))
             .to_owned();
 
         let row = self
@@ -4412,7 +4521,7 @@ impl VectorDB for PgVectorAdapter {
     async fn list_collections(&self) -> VectorDBResult<Vec<(String, String)>> {
         let query = Query::select()
             .columns([VColl::DataType, VColl::FieldName])
-            .from(VColl::Table)
+            .from(self.vcoll_ref())
             .order_by(VColl::CollectionName, Order::Asc)
             .to_owned();
 
@@ -4571,8 +4680,8 @@ mod migrator {
     reason = "tests drive configuration through the process env"
 )]
 mod shared_db_migration_tests {
-    use super::PgVectorAdapter;
-    use sea_orm::{ConnectionTrait, Database, Statement};
+    use super::{PgVectorAdapter, VectorDB};
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
     use sea_orm_migration::prelude::*;
 
     fn test_url() -> Option<String> {
@@ -4787,6 +4896,130 @@ mod shared_db_migration_tests {
             drop(adapter);
             drop(db);
         })
+        .await;
+    }
+
+    /// M38: a pinned-schema adapter must never touch `public`'s same-named
+    /// tables — the `search_path = ds_…, public` deployment Python's
+    /// `pgvector_shared` handler creates. The adapter's every statement is
+    /// schema-qualified, so a `public` table of the same name — the shared
+    /// store of an earlier deployment — is neither read, written nor
+    /// dropped, and the schema disappearing behind the adapter's back is an
+    /// error, never a silent redirect.
+    #[tokio::test]
+    async fn a_pinned_adapter_never_resolves_publics_same_named_tables() {
+        with_temp_db(
+            "a_pinned_adapter_never_resolves_publics_same_named_tables",
+            |url| async move {
+                // The shared store left in `public`, seeding the trap.
+                let public = Database::connect(&url).await.expect("public conn");
+                public
+                    .execute_unprepared("CREATE EXTENSION IF NOT EXISTS vector")
+                    .await
+                    .expect("vector extension");
+                public
+                    .execute_unprepared("CREATE SCHEMA ds_x")
+                    .await
+                    .expect("create schema");
+                public
+                    .execute_unprepared(
+                        r#"CREATE TABLE public."Sent_f" (
+                        id UUID PRIMARY KEY,
+                        vector vector(8),
+                        metadata JSONB NOT NULL DEFAULT '{}'
+                    )"#,
+                    )
+                    .await
+                    .expect("seed sentinel table");
+                public
+                    .execute_unprepared(
+                        r#"INSERT INTO public."Sent_f" VALUES
+                        ('00000000-0000-0000-0000-000000000001',
+                         '[1,0,0,0,0,0,0,0]', '{"tag": "public-sentinel"}')"#,
+                    )
+                    .await
+                    .expect("seed sentinel row");
+
+                // The pinned adapter: `search_path = ds_x, public`, as the
+                // `pgvector_shared` handler pins it via libpq `options`.
+                let pinned_url = format!("{url}?options=-c%20search_path%3Dds_x,public");
+                let adapter = PgVectorAdapter::new(&pinned_url, 8)
+                    .await
+                    .expect("pinned adapter");
+
+                adapter
+                    .create_collection("Sent", "f", 8)
+                    .await
+                    .expect("create in ds_x");
+                let points = vec![crate::models::VectorPoint::new(
+                    uuid::Uuid::new_v4(),
+                    vec![1.0; 8],
+                )];
+                adapter
+                    .index_points("Sent", "f", &points)
+                    .await
+                    .expect("index in ds_x");
+                let hits = adapter
+                    .search_similar("Sent", "f", &[1.0; 8], 10)
+                    .await
+                    .expect("search in ds_x");
+                assert_eq!(hits.len(), 1, "ds_x row must come back, not public's");
+
+                // The public sentinel is untouched by the create/write above.
+                let sentinel = public
+                    .query_one(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        r#"SELECT count(*) AS n FROM public."Sent_f""#.to_string(),
+                    ))
+                    .await
+                    .expect("count sentinel")
+                    .expect("row");
+                let n: i64 = sentinel.try_get("", "n").expect("n");
+                assert_eq!(n, 1, "public sentinel must still hold only its own row");
+
+                // ds_x disappears behind the adapter's back (dataset dropped by
+                // another process): every statement now errors instead of falling
+                // through `search_path` to `public."Sent_f"`.
+                public
+                    .execute_unprepared("DROP SCHEMA ds_x CASCADE")
+                    .await
+                    .expect("drop schema");
+                let err = adapter
+                    .search_similar("Sent", "f", &[1.0; 8], 10)
+                    .await
+                    .expect_err("a dropped schema must error, not read public");
+                assert!(
+                    err.to_string().contains("does not exist"),
+                    "expected a missing-relation error, got {err}"
+                );
+
+                // `collection_size` must fail too — an unqualified COUNT
+                // would have silently answered with public's sentinel (1).
+                let err = adapter
+                    .collection_size("Sent", "f")
+                    .await
+                    .expect_err("count on a dropped schema must error, not read public");
+                assert!(
+                    err.to_string().contains("does not exist"),
+                    "expected a missing-relation error, got {err}"
+                );
+
+                // And still: public's table is untouched — not dropped, not
+                // read through.
+                let sentinel = public
+                    .query_one(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        r#"SELECT count(*) AS n FROM public."Sent_f""#.to_string(),
+                    ))
+                    .await
+                    .expect("count sentinel")
+                    .expect("row");
+                let n: i64 = sentinel.try_get("", "n").expect("n");
+                assert_eq!(n, 1, "public sentinel survives the schema drop too");
+
+                adapter.close().await.expect("close pinned pool");
+            },
+        )
         .await;
     }
 }
