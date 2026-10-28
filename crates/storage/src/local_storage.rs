@@ -15,17 +15,67 @@ impl LocalStorage {
         Self { base_path }
     }
 
-    /// Generate a UUID-based subdirectory structure for organizing files
-    /// Returns a relative path like "ab/cd/filename.txt"
+    /// `file_name` must be exactly one ordinary path component — anything
+    /// else (`../x`, `a/b`, an absolute path, `.`, `..`, a backslash or NUL)
+    /// would escape `base_path` through the unchecked `join`.
+    fn validate_file_name(file_name: &str) -> Result<(), StorageError> {
+        let mut components = Path::new(file_name).components();
+        let single_normal = matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(c)), None) if c == file_name
+        ) && !file_name.contains(['/', '\\', '\0']);
+        if !single_normal {
+            return Err(StorageError::InvalidPath(format!(
+                "file_name must be a single path component: {file_name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Generate a UUID-based subdirectory structure for organizing files.
+    /// Returns a relative path like "ab/cd/<32-hex-uuid>/filename.txt" — the
+    /// full UUID becomes the file's own directory, so two stores of the same
+    /// `file_name` land in different places instead of colliding under the
+    /// 65,536 destinations the old 2+2-hex fan-out allowed.
     fn generate_storage_path(&self, file_name: &str) -> String {
-        let uuid = Uuid::new_v4();
-        let uuid_str = uuid.to_string();
+        let id = Uuid::new_v4().simple().to_string();
+        format!("{}/{}/{}/{file_name}", &id[..2], &id[2..4], id)
+    }
 
-        // Use first 4 chars for first directory, next 4 for second
-        let dir1 = &uuid_str[..2];
-        let dir2 = &uuid_str[2..4];
+    /// Pick a fresh storage path and create it exclusively — a store never
+    /// overwrites an existing file (Python's LocalFileStorage.store does not
+    /// overwrite unless asked). On an `AlreadyExists` collision the attempt
+    /// retries with a new path, up to 3 attempts.
+    async fn create_destination(
+        &self,
+        file_name: &str,
+    ) -> Result<(String, fs::File), StorageError> {
+        for attempt in 0..3 {
+            let relative_path = self.generate_storage_path(file_name);
+            let full_path = self.base_path.join(&relative_path);
 
-        format!("{dir1}/{dir2}/{file_name}")
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    StorageError::IoError(format!("Failed to create directory: {e}"))
+                })?;
+            }
+
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&full_path)
+                .await
+            {
+                Ok(file) => return Ok((relative_path, file)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt + 1 < 3 => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(StorageError::IoError(format!("Failed to create file: {e}")));
+                }
+            }
+        }
+        unreachable!("the retry loop returns on success or the last error")
     }
 
     /// Resolve a location string into a filesystem path.
@@ -62,20 +112,8 @@ impl StorageTrait for LocalStorage {
 
     #[instrument(name = "storage.store", skip(self, data), fields(file_name, bytes = data.len()))]
     async fn store(&self, data: &[u8], file_name: &str) -> Result<String, StorageError> {
-        let relative_path = self.generate_storage_path(file_name);
-        let full_path = self.base_path.join(&relative_path);
-
-        // Create parent directories
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::IoError(format!("Failed to create directory: {e}")))?;
-        }
-
-        // Write file
-        let mut file = fs::File::create(&full_path)
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to create file: {e}")))?;
+        Self::validate_file_name(file_name)?;
+        let (relative_path, mut file) = self.create_destination(file_name).await?;
 
         file.write_all(data)
             .await
@@ -94,20 +132,8 @@ impl StorageTrait for LocalStorage {
         reader: &mut (dyn AsyncRead + Unpin + Send),
         file_name: &str,
     ) -> Result<String, StorageError> {
-        let relative_path = self.generate_storage_path(file_name);
-        let full_path = self.base_path.join(&relative_path);
-
-        // Create parent directories
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::IoError(format!("Failed to create directory: {e}")))?;
-        }
-
-        // Create file
-        let mut file = fs::File::create(&full_path)
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to create file: {e}")))?;
+        Self::validate_file_name(file_name)?;
+        let (relative_path, mut file) = self.create_destination(file_name).await?;
 
         // Stream copy from reader to file
         tokio::io::copy(reader, &mut file)
@@ -123,21 +149,8 @@ impl StorageTrait for LocalStorage {
 
     #[instrument(name = "storage.create_writer", skip(self), fields(file_name))]
     async fn create_writer(&self, file_name: &str) -> Result<StorageWriter, StorageError> {
-        let relative_path = self.generate_storage_path(file_name);
-        let full_path = self.base_path.join(&relative_path);
-
-        // Create parent directories
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::IoError(format!("Failed to create directory: {e}")))?;
-        }
-
-        // Create file
-        let file = fs::File::create(&full_path)
-            .await
-            .map_err(|e| StorageError::IoError(format!("Failed to create file: {e}")))?;
-
+        Self::validate_file_name(file_name)?;
+        let (relative_path, file) = self.create_destination(file_name).await?;
         Ok(StorageWriter::new(file, relative_path))
     }
 
@@ -327,5 +340,78 @@ mod tests {
         storage.delete(&location).await.unwrap();
 
         assert!(!storage.exists(&location).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejects_file_names_that_are_not_a_single_component() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_path_buf());
+        storage.initialize().await.unwrap();
+
+        for name in [
+            "../x",
+            "a/b",
+            "/abs",
+            "",
+            ".",
+            "..",
+            "a\\b",
+            "x\0y",
+            "../../etc/passwd",
+        ] {
+            assert!(
+                matches!(
+                    storage.store(b"d", name).await,
+                    Err(StorageError::InvalidPath(_))
+                ),
+                "{name:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_stores_of_the_same_name_get_distinct_locations_and_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_path_buf());
+        storage.initialize().await.unwrap();
+
+        let loc1 = storage.store(b"first", "same.txt").await.unwrap();
+        let loc2 = storage.store(b"second", "same.txt").await.unwrap();
+
+        assert_ne!(loc1, loc2, "same-name stores must not collide");
+        assert_eq!(storage.retrieve(&loc1).await.unwrap(), b"first");
+        assert_eq!(storage.retrieve(&loc2).await.unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn storage_locations_carry_the_full_uuid_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_path_buf());
+        storage.initialize().await.unwrap();
+
+        let loc = storage.store(b"x", "name.txt").await.unwrap();
+        let parts: Vec<&str> = loc.split('/').collect();
+        assert_eq!(
+            (parts[0].len(), parts[1].len(), parts[2].len(), parts[3]),
+            (2, 2, 32, "name.txt"),
+            "location {loc:?} does not match the fan-out shape"
+        );
+        assert!(
+            parts[..3]
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit())),
+            "fan-out dirs must be hex: {loc:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_stream_dyn_and_create_writer_also_validate_the_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_path_buf());
+        storage.initialize().await.unwrap();
+
+        let mut reader: &[u8] = b"x";
+        assert!(storage.store_stream_dyn(&mut reader, "../x").await.is_err());
+        assert!(storage.create_writer("../x").await.is_err());
     }
 }
