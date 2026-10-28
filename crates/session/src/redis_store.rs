@@ -295,6 +295,15 @@ impl SessionStore for RedisSessionStore {
         let key = session_key(user_id, session_id);
         let mut conn = self.conn.clone();
         let deleted: i64 = conn.del(&key).await.map_err(map_err)?;
+
+        // Erasure parity with Python's delete_session: the session's graph
+        // context and agent-trace keys go too. The return value stays "did
+        // the QA key exist", so the extra DELs must not change it.
+        let gk_key = graph_context_key(user_id, session_id);
+        let tr_key = trace_key(user_id.unwrap_or("default"), session_id);
+        conn.del::<_, ()>(&gk_key).await.map_err(map_err)?;
+        conn.del::<_, ()>(&tr_key).await.map_err(map_err)?;
+
         Ok(deleted > 0)
     }
 
@@ -365,6 +374,18 @@ impl SessionStore for RedisSessionStore {
 
         if !gk_keys.is_empty() {
             conn.del::<_, ()>(&gk_keys).await.map_err(map_err)?;
+        }
+
+        // Also delete agent-trace keys — Python's prune() FLUSHDBs, so
+        // `cognee:trace:*` must not survive a prune here either.
+        let tr_keys: Vec<String> = redis::cmd("KEYS")
+            .arg("cognee:trace:*")
+            .query_async(&mut conn)
+            .await
+            .map_err(map_err)?;
+
+        if !tr_keys.is_empty() {
+            conn.del::<_, ()>(&tr_keys).await.map_err(map_err)?;
         }
 
         Ok(())
@@ -607,5 +628,108 @@ mod tests {
         let info = connection_info("h", 1, "", "secret");
         assert_eq!(info.redis.username, None);
         assert_eq!(info.redis.password.as_deref(), Some("secret"));
+    }
+
+    /// `delete_session` and `prune` must erase every record kind (QA, graph
+    /// context, trace steps) — needs `REDIS_TEST_URL`; skipped when unset.
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tests drive configuration through the process env"
+    )]
+    async fn delete_session_and_prune_erase_every_record_kind() {
+        use super::RedisSessionStore;
+        use crate::session_store::SessionStore;
+        use crate::types::SessionTraceStep;
+
+        let Some(url) = std::env::var("REDIS_TEST_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        else {
+            eprintln!(
+                "REDIS_TEST_URL not set — skipping delete_session_and_prune_erase_every_record_kind"
+            );
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let s1 = format!("era-s1-{suffix}");
+        let s2 = format!("era-s2-{suffix}");
+        let user = format!("era-user-{suffix}");
+        let step = |id: &str| SessionTraceStep {
+            trace_id: id.to_string(),
+            origin_function: "fn".to_string(),
+            status: "success".to_string(),
+            memory_query: String::new(),
+            memory_context: String::new(),
+            method_params: serde_json::json!({}),
+            method_return_value: None,
+            error_message: String::new(),
+            session_feedback: String::new(),
+        };
+
+        let store = RedisSessionStore::new(&url).await.unwrap();
+        for sid in [&s1, &s2] {
+            store
+                .create_qa_entry(sid, Some(&user), "q", "a", None)
+                .await
+                .unwrap();
+            store
+                .set_graph_context(sid, Some(&user), "ctx")
+                .await
+                .unwrap();
+            store
+                .save_trace_step(&user, sid, step(&format!("t-{sid}")))
+                .await
+                .unwrap();
+        }
+
+        assert!(store.delete_session(&s1, Some(&user)).await.unwrap());
+        assert!(
+            store
+                .get_all_qa_entries(&s1, Some(&user))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_graph_context(&s1, Some(&user))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.read_trace_steps(&user, &s1).await.unwrap().is_empty());
+        // The sibling session keeps every record kind.
+        assert_eq!(
+            store
+                .get_all_qa_entries(&s2, Some(&user))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.read_trace_steps(&user, &s2).await.unwrap().len(), 1);
+
+        store.prune().await.unwrap();
+        assert!(
+            store
+                .get_all_qa_entries(&s2, Some(&user))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.read_trace_steps(&user, &s2).await.unwrap().is_empty());
+        // Paranoia: no trace keys of ours survive anywhere.
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let leftovers: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("cognee:trace:{user}:*"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }

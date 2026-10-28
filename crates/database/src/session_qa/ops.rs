@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -104,13 +104,17 @@ pub async fn delete_session(
     session_id: &str,
     user_id: Option<&str>,
 ) -> Result<u64, DatabaseError> {
+    // One transaction so QA entries, graph context and trace steps for the
+    // session are erased together — a partial erase must never be observable.
+    let txn = db.begin().await.map_err(map_db_err)?;
+
     let mut delete = entity::Entity::delete_many().filter(entity::Column::SessionId.eq(session_id));
 
     if let Some(uid) = user_id {
         delete = delete.filter(entity::Column::UserId.eq(uid));
     }
 
-    let result = delete.exec(db).await.map_err(map_db_err)?;
+    let result = delete.exec(&txn).await.map_err(map_db_err)?;
 
     // Also delete graph context for this session
     let mut gc_delete = entity::graph_context::Entity::delete_many()
@@ -118,7 +122,17 @@ pub async fn delete_session(
     if let Some(uid) = user_id {
         gc_delete = gc_delete.filter(entity::graph_context::Column::UserId.eq(uid));
     }
-    let _ = gc_delete.exec(db).await.map_err(map_db_err)?;
+    let _ = gc_delete.exec(&txn).await.map_err(map_db_err)?;
+
+    // And the session's agent-trace steps (same optional user filter).
+    let mut trace_delete = entity::trace_step::Entity::delete_many()
+        .filter(entity::trace_step::Column::SessionId.eq(session_id));
+    if let Some(uid) = user_id {
+        trace_delete = trace_delete.filter(entity::trace_step::Column::UserId.eq(uid));
+    }
+    let _ = trace_delete.exec(&txn).await.map_err(map_db_err)?;
+
+    txn.commit().await.map_err(map_db_err)?;
 
     Ok(result.rows_affected)
 }
@@ -141,16 +155,25 @@ pub async fn delete_qa_entry(
     Ok(result.rows_affected > 0)
 }
 
-/// Delete all rows from the session_qa_entries and session_graph_context tables (prune).
+/// Delete all rows from the session_qa_entries, session_graph_context and
+/// session_trace_steps tables (prune — matches Python's SqlCacheAdapter,
+/// which drops its trace table too). One transaction so a partial erase is
+/// never observable.
 pub async fn delete_all(db: &DatabaseConnection) -> Result<(), DatabaseError> {
+    let txn = db.begin().await.map_err(map_db_err)?;
     entity::Entity::delete_many()
-        .exec(db)
+        .exec(&txn)
         .await
         .map_err(map_db_err)?;
     entity::graph_context::Entity::delete_many()
-        .exec(db)
+        .exec(&txn)
         .await
         .map_err(map_db_err)?;
+    entity::trace_step::Entity::delete_many()
+        .exec(&txn)
+        .await
+        .map_err(map_db_err)?;
+    txn.commit().await.map_err(map_db_err)?;
     Ok(())
 }
 
