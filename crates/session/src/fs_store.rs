@@ -119,9 +119,11 @@ impl FsSessionStore {
 /// end with `.traces`, never start with `_graph_context_` or `%`, and an
 /// encoded name starts with `%` and contains no `.` or `_` at all, so no QA
 /// name can equal a trace or context name (and those two cannot collide
-/// either). Without that, session `s`'s trace file would be session
-/// `s.traces`'s QA file — and `delete_session("s")` would erase another
-/// session's data.
+/// either). The checks are ASCII case-insensitive because on
+/// case-insensitive filesystems (macOS, Windows) `X.TRACES.json` is the
+/// same entry as `x.traces.json`. Without that, session `s`'s trace file
+/// would be session `s.traces`'s QA file — and `delete_session("s")` would
+/// erase another session's data.
 fn path_component(id: &str) -> Cow<'_, str> {
     fn is_unsafe_char(c: char) -> bool {
         if c == '/' || c == '\0' {
@@ -134,12 +136,13 @@ fn path_component(id: &str) -> Cow<'_, str> {
         }
         false
     }
+    let lower = id.to_ascii_lowercase();
     let unsafe_id = id.is_empty()
         || id == "."
         || id == ".."
         || id.starts_with('%')
-        || id.ends_with(".traces")
-        || id.starts_with("_graph_context_")
+        || lower.ends_with(".traces")
+        || lower.starts_with("_graph_context_")
         || id.chars().any(is_unsafe_char);
     if !unsafe_id {
         return Cow::Borrowed(id);
@@ -248,6 +251,41 @@ fn graph_context_file(base: &Path, user_id: Option<&str>, session_id: &str) -> P
 fn trace_session_file(base: &Path, user_id: &str, session_id: &str) -> PathBuf {
     base.join(path_component(user_id).as_ref())
         .join(format!("{}.traces.json", path_component(session_id)))
+}
+
+/// Remove a per-session record file for `delete_session`. `NotFound` is the
+/// only tolerable miss; any other I/O error is returned. Before removing,
+/// the file is read once: if it parses as a Q&A list it is another
+/// session's QA file, reachable here only through the pre-encoding layout
+/// ambiguity (a session literally named `x.traces` or `_graph_context_x`
+/// had its QA file at this very path before [`path_component`] existed),
+/// so it must be left alone. A file that parses as neither a Q&A list nor
+/// the expected record kind cannot be a sibling's data and is removed.
+async fn remove_record_file(path: &Path) -> Result<(), SessionError> {
+    match fs::read_to_string(path).await {
+        Ok(contents) if serde_json::from_str::<Vec<FsQAEntry>>(&contents).is_ok() => {
+            tracing::debug!(
+                target: "cognee.session",
+                path = %path.display(),
+                "leaving a legacy Q&A file in place during session deletion"
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(SessionError::StoreError(format!(
+                "fs read error before delete: {e}"
+            )));
+        }
+    }
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SessionError::StoreError(format!(
+            "fs delete record-file error: {e}"
+        ))),
+    }
 }
 
 async fn load_trace_steps(path: &Path) -> Result<Vec<SessionTraceStep>, SessionError> {
@@ -376,28 +414,12 @@ impl SessionStore for FsSessionStore {
         // the only tolerable miss — anything else means erasure is
         // incomplete and must not report success.
         let gc_path = graph_context_file(&self.base_dir, user_id, session_id);
-        match fs::remove_file(&gc_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(SessionError::StoreError(format!(
-                    "fs delete graph-context error: {e}"
-                )));
-            }
-        }
+        remove_record_file(&gc_path).await?;
 
         // And the agent-trace file (same NotFound-only semantics).
         let trace_path =
             trace_session_file(&self.base_dir, user_id.unwrap_or("default"), session_id);
-        match fs::remove_file(&trace_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(SessionError::StoreError(format!(
-                    "fs delete trace-file error: {e}"
-                )));
-            }
-        }
+        remove_record_file(&trace_path).await?;
 
         Ok(existed)
     }
@@ -1061,6 +1083,88 @@ mod tests {
                 .is_empty()
         );
         assert!(store.read_trace_steps("u1", "s").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn layout_triggers_are_ascii_case_insensitive() {
+        // Case-insensitive filesystems fold these onto the raw layouts.
+        let base = Path::new("/base");
+        let raw_qa = session_file(base, Some("u"), "s");
+        let raw_trace = trace_session_file(base, "u", "s");
+        for sid in ["S.TRACES", "s.Traces", "_GRAPH_CONTEXT_x", "x.TRACES"] {
+            let qa = session_file(base, Some("u"), sid);
+            assert_ne!(qa, raw_trace, "{sid:?} must not alias a trace file");
+            assert_ne!(qa, raw_qa.with_file_name("_graph_context_s.json"));
+        }
+        assert_eq!(
+            decode(&path_component("S.TRACES")),
+            "S.TRACES",
+            "encoded case-insensitive ids still round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_keeps_a_legacy_qa_file_at_the_trace_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let store = FsSessionStore::new(base);
+        // A pre-encoding store wrote session "s.traces"'s QA file at the raw
+        // name `s.traces.json` — the same path that is `s`'s trace file.
+        let user_dir = base.join("u1");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let legacy_qa = user_dir.join("s.traces.json");
+        let entries = vec![FsQAEntry {
+            time: "t".to_string(),
+            question: "q".to_string(),
+            context: "c".to_string(),
+            answer: "a".to_string(),
+            qa_id: "qa-1".to_string(),
+            feedback_text: None,
+            feedback_score: None,
+            used_graph_element_ids: None,
+            memify_metadata: None,
+        }];
+        std::fs::write(&legacy_qa, serde_json::to_string(&entries).unwrap()).unwrap();
+
+        store
+            .create_qa_entry("s", Some("u1"), "q", "a", None)
+            .await
+            .unwrap();
+        assert!(store.delete_session("s", Some("u1")).await.unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&legacy_qa).unwrap(),
+            serde_json::to_string(&entries).unwrap(),
+            "the legacy Q&A file at the trace path must survive"
+        );
+        // A real trace file at the same path is still removed (the legacy
+        // file is lifted out of the way first — while it sits there it also
+        // blocks `s`'s trace writes, which fail to parse it).
+        std::fs::remove_file(&legacy_qa).unwrap();
+        store
+            .save_trace_step(
+                "u1",
+                "s",
+                SessionTraceStep {
+                    trace_id: "t1".to_string(),
+                    origin_function: "f".to_string(),
+                    status: "success".to_string(),
+                    memory_query: String::new(),
+                    memory_context: String::new(),
+                    method_params: serde_json::json!({}),
+                    method_return_value: None,
+                    error_message: String::new(),
+                    session_feedback: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create_qa_entry("s", Some("u1"), "q2", "a2", None)
+            .await
+            .unwrap();
+        assert!(store.delete_session("s", Some("u1")).await.unwrap());
+        assert!(!trace_session_file(base, "u1", "s").exists());
     }
 
     #[tokio::test]
