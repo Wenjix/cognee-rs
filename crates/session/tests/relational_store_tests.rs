@@ -584,3 +584,93 @@ async fn test_sea_orm_trace_step_isolation() {
     assert_eq!(a2.len(), 1);
     assert_eq!(a2[0].trace_id, "a-2");
 }
+
+#[tokio::test]
+async fn delete_session_erases_qa_context_and_traces_for_only_that_session() {
+    let store = setup_store().await;
+    for sid in ["s1", "s2"] {
+        store
+            .create_qa_entry(sid, Some("u"), "q", "a", None)
+            .await
+            .unwrap();
+        store
+            .set_graph_context(sid, Some("u"), "ctx")
+            .await
+            .unwrap();
+        store
+            .save_trace_step("u", sid, make_step(&format!("t-{sid}"), "fn"))
+            .await
+            .unwrap();
+    }
+
+    assert!(store.delete_session("s1", Some("u")).await.unwrap());
+
+    assert!(
+        store
+            .get_all_qa_entries("s1", Some("u"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_graph_context("s1", Some("u"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.read_trace_steps("u", "s1").await.unwrap().is_empty());
+
+    // The sibling session keeps every record kind.
+    assert_eq!(
+        store
+            .get_all_qa_entries("s2", Some("u"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .get_graph_context("s2", Some("u"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.read_trace_steps("u", "s2").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn prune_erases_trace_steps_too() {
+    let store = setup_store().await;
+    store
+        .create_qa_entry("s1", Some("u"), "q", "a", None)
+        .await
+        .unwrap();
+    store
+        .set_graph_context("s1", Some("u"), "ctx")
+        .await
+        .unwrap();
+    store
+        .save_trace_step("u", "s1", make_step("t1", "fn"))
+        .await
+        .unwrap();
+
+    store.prune().await.unwrap();
+
+    assert!(
+        store
+            .get_all_qa_entries("s1", Some("u"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_graph_context("s1", Some("u"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.read_trace_steps("u", "s1").await.unwrap().is_empty());
+}

@@ -361,6 +361,11 @@ impl SessionStore for FsSessionStore {
         let gc_path = graph_context_file(&self.base_dir, user_id, session_id);
         let _ = fs::remove_file(&gc_path).await; // ignore NotFound
 
+        // And the agent-trace file (same best-effort semantics).
+        let trace_path =
+            trace_session_file(&self.base_dir, user_id.unwrap_or("default"), session_id);
+        let _ = fs::remove_file(&trace_path).await; // ignore NotFound
+
         Ok(existed)
     }
 

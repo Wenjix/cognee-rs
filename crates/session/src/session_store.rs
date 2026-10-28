@@ -63,7 +63,9 @@ pub trait SessionStore: Send + Sync {
         user_id: Option<&str>,
     ) -> Result<Vec<SessionQAEntry>, SessionError>;
 
-    /// Delete all entries for a session. Returns `true` if the session existed.
+    /// Delete all of a session's records — Q&A entries, graph context and
+    /// agent-trace steps — as Python's `delete_session` does on every
+    /// backend. Returns `true` if the session existed.
     async fn delete_session(
         &self,
         session_id: &str,
@@ -78,7 +80,8 @@ pub trait SessionStore: Send + Sync {
         qa_id: &str,
     ) -> Result<bool, SessionError>;
 
-    /// Delete ALL session data across all users and sessions.
+    /// Delete ALL session data across all users and sessions — Q&A entries,
+    /// graph context and agent-trace steps alike.
     /// Equivalent to Python's `CacheDBInterface.prune()`.
     async fn prune(&self) -> Result<(), SessionError>;
 
